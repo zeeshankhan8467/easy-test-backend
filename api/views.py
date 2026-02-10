@@ -8,7 +8,10 @@ from django.utils import timezone
 from datetime import timedelta
 import pandas as pd
 import json
+import logging
 from io import BytesIO
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     Exam, Question, ExamQuestion, Participant,
@@ -207,9 +210,274 @@ class ExamViewSet(viewsets.ModelViewSet):
                     'is_optional': eq.is_optional,
                 })
         
+        # Include version for client validation (only when frozen)
+        if exam.snapshot_version:
+            snapshot_data['snapshot_version'] = exam.snapshot_version
         response = Response(snapshot_data)
         response['Content-Disposition'] = f'attachment; filename="exam-{exam.id}-snapshot.json"'
         return response
+
+    @action(detail=True, methods=['post'])
+    def sync_live_results(self, request, pk=None):
+        """
+        Submit live clicker responses and attendance from EasyTest Live app.
+        Body: {
+            "responses": [
+                {"participant_id": 1, "question_id": 2, "selected_answer": 0, "answered_at": "ISO8601"},
+                {"clicker_id": "123", ...}  // alternative: resolve participant by clicker_id
+            ],
+            "attendance": [1, 2, 3]  // optional: participant_ids to mark present
+        }
+        selected_answer: 0-based index (MCQ) or list of indices (multiple_select). Letter "A"=0, "B"=1, etc.
+        """
+        exam = self.get_object()
+        if exam.status not in ('frozen', 'completed'):
+            logger.warning('[sync_live_results] Exam %s not frozen/completed, status=%s', pk, exam.status)
+            return Response(
+                {'error': 'Exam must be frozen to accept live results'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        responses_data = request.data.get('responses', [])
+        attendance_ids = request.data.get('attendance', [])
+        logger.info(
+            '[sync_live_results] Exam id=%s: received %d responses, %d attendance',
+            pk, len(responses_data), len(attendance_ids)
+        )
+
+        # Build snapshot question lookup (question_id -> correct_answer, positive_marks, negative_marks)
+        snapshot = exam.snapshot_data or {}
+        questions_list = snapshot.get('questions', [])
+        if questions_list:
+            snapshot_questions = {int(q['question_id']): q for q in questions_list}
+        else:
+            snapshot_questions = {}
+            for eq in exam.exam_questions.select_related('question').order_by('order'):
+                snapshot_questions[eq.question_id] = {
+                    'correct_answer': eq.question.correct_answer,
+                    'positive_marks': float(eq.positive_marks),
+                    'negative_marks': float(eq.negative_marks),
+                }
+
+        # Resolve participant by id or clicker_id; create one from clicker_id if missing (e.g. deviceId fallback when SDK keySN is empty)
+        def get_or_create_participant_for_clicker(participant_id=None, clicker_id=None):
+            if participant_id:
+                try:
+                    p = Participant.objects.get(id=participant_id)
+                    ExamParticipant.objects.get_or_create(exam=exam, participant=p)
+                    return p
+                except Participant.DoesNotExist:
+                    pass
+            if clicker_id:
+                clicker_id_str = str(clicker_id).strip()
+                if not clicker_id_str:
+                    return None
+                try:
+                    p = Participant.objects.get(clicker_id=clicker_id_str)
+                    if ExamParticipant.objects.filter(exam=exam, participant=p).exists():
+                        return p
+                    ExamParticipant.objects.get_or_create(exam=exam, participant=p)
+                    return p
+                except Participant.DoesNotExist:
+                    pass
+                # When app sends deviceId fallback (d1_timestamp) because SDK keySN is empty, match to participant with clicker_id = number (e.g. "1")
+                if clicker_id_str.startswith('d') and '_' in clicker_id_str:
+                    num_part = clicker_id_str[1:].split('_')[0]
+                    if num_part.isdigit():
+                        try:
+                            p = Participant.objects.get(clicker_id=num_part)
+                            ExamParticipant.objects.get_or_create(exam=exam, participant=p)
+                            return p
+                        except Participant.DoesNotExist:
+                            pass
+                # Auto-create participant only if no match (e.g. when SDK sends empty keySN and no participant has that clicker number)
+                safe_id = ''.join(c if c.isalnum() or c in '_-' else '_' for c in clicker_id_str)[:50]
+                email = f'clicker-{safe_id}@easytest.local'
+                p, created = Participant.objects.get_or_create(
+                    clicker_id=clicker_id_str,
+                    defaults={'name': 'Student', 'email': email}
+                )
+                if created:
+                    logger.info('[sync_live_results] Auto-created participant id=%s clicker_id=%s for exam %s', p.id, clicker_id_str, pk)
+                ExamParticipant.objects.get_or_create(exam=exam, participant=p)
+                return p
+            return None
+
+        # Normalize selected_answer to 0-based index or list
+        def normalize_selected(val):
+            if val is None:
+                return None
+            if isinstance(val, list):
+                return [int(x) if isinstance(x, int) else (ord(str(x).upper()[0]) - 65) for x in val]
+            if isinstance(val, int):
+                return val
+            s = str(val).strip().upper()
+            if s and s[0] in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
+                return ord(s[0]) - 65
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return None
+
+        def is_correct(question_info, selected):
+            correct = question_info.get('correct_answer')
+            if correct is None:
+                return False
+            if isinstance(correct, list):
+                return sorted(selected if isinstance(selected, list) else [selected]) == sorted(correct)
+            return (selected if isinstance(selected, int) else (selected[0] if selected else None)) == correct
+
+        created_attempts = {}
+        participant_names = {}  # clicker_id or participant_id -> name for live app display
+        answers_created = 0
+        skipped_no_participant = 0
+        skipped_no_question = 0
+        skipped_already_answered = 0
+        for item in responses_data:
+            participant = get_or_create_participant_for_clicker(
+                participant_id=item.get('participant_id'),
+                clicker_id=item.get('clicker_id')
+            )
+            if not participant:
+                skipped_no_participant += 1
+                continue
+            cid = item.get('clicker_id')
+            if cid is not None:
+                participant_names[str(cid)] = participant.name
+            participant_names[str(participant.id)] = participant.name
+            question_id = item.get('question_id')
+            if question_id is None:
+                continue
+            question_id = int(question_id)
+            if question_id not in snapshot_questions:
+                skipped_no_question += 1
+                continue
+            qinfo = snapshot_questions[question_id]
+            selected = normalize_selected(item.get('selected_answer'))
+            if selected is None:
+                continue
+
+            attempt, _ = ExamAttempt.objects.get_or_create(
+                exam=exam,
+                participant=participant,
+                defaults={'total_questions': len(snapshot_questions)}
+            )
+            created_attempts[participant.id] = attempt
+
+            # One response per participant per question - do not overwrite
+            if Answer.objects.filter(attempt=attempt, question_id=question_id).exists():
+                skipped_already_answered += 1
+                continue
+
+            correct = is_correct(qinfo, selected)
+            pos = float(qinfo.get('positive_marks', 1))
+            neg = float(qinfo.get('negative_marks', 0))
+            time_taken = 0
+            if item.get('answered_at') and attempt.started_at:
+                try:
+                    raw = item['answered_at']
+                    if isinstance(raw, str):
+                        from datetime import datetime
+                        answered = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+                        if timezone.is_naive(answered):
+                            answered = timezone.make_aware(answered)
+                        time_taken = max(0, int((answered - attempt.started_at).total_seconds()))
+                except Exception:
+                    pass
+
+            Answer.objects.create(
+                attempt=attempt,
+                question_id=question_id,
+                selected_answer=selected if isinstance(selected, list) else [selected],
+                is_correct=correct,
+                time_taken=time_taken
+            )
+            answers_created += 1
+
+        logger.info(
+            '[sync_live_results] Exam id=%s: answers_created=%d, attempts_updated=%d, '
+            'skipped_no_participant=%d, skipped_no_question=%d, skipped_already_answered=%d',
+            pk, answers_created, len(created_attempts),
+            skipped_no_participant, skipped_no_question, skipped_already_answered
+        )
+
+        # Recalculate attempt totals and submitted_at
+        for attempt in created_attempts.values():
+            answers = Answer.objects.filter(attempt=attempt)
+            total = attempt.total_questions or 0
+            correct_count = answers.filter(is_correct=True).count()
+            wrong_count = answers.filter(is_correct=False).count()
+            unattempted = max(0, total - answers.count())
+            total_marks = sum(float(snapshot_questions.get(a.question_id, {}).get('positive_marks', 1)) for a in answers.filter(is_correct=True))
+            total_marks -= sum(float(snapshot_questions.get(a.question_id, {}).get('negative_marks', 0)) for a in answers.filter(is_correct=False))
+            attempt.correct_answers = correct_count
+            attempt.wrong_answers = wrong_count
+            attempt.unattempted = unattempted
+            attempt.score = total_marks
+            attempt.submitted_at = timezone.now()
+            if answers.exists():
+                last_ans = answers.order_by('-answered_at').first()
+                if last_ans and attempt.started_at:
+                    attempt.time_taken = max(0, int((last_ans.answered_at - attempt.started_at).total_seconds()))
+            attempt.save()
+
+        # Mark attendance for listed participants (at least one response already marks present; this can add late-joiners)
+        for pid in attendance_ids:
+            try:
+                p = Participant.objects.get(id=pid)
+                if ExamParticipant.objects.filter(exam=exam, participant=p).exists():
+                    ExamAttempt.objects.get_or_create(
+                        exam=exam,
+                        participant=p,
+                        defaults={'total_questions': len(snapshot_questions), 'submitted_at': timezone.now()}
+                    )
+            except Participant.DoesNotExist:
+                pass
+
+        logger.info(
+            '[sync_live_results] Exam id=%s: done. synced=%d, attempts_updated=%d',
+            pk, answers_created, len(created_attempts)
+        )
+        return Response({
+            'synced': answers_created,
+            'attempts_updated': len(created_attempts),
+            'received': len(responses_data),
+            'skipped_no_participant': skipped_no_participant,
+            'skipped_no_question': skipped_no_question,
+            'skipped_already_answered': skipped_already_answered,
+            'participant_names': participant_names,
+        })
+
+    @action(detail=True, methods=['get'], url_path='attendance')
+    def attendance(self, request, pk=None):
+        """
+        GET /api/exams/{id}/attendance/
+        Returns attendance for the exam: list of participants with present/absent.
+        Present = has an ExamAttempt for this exam (taken attendance or submitted answers).
+        """
+        exam = self.get_object()
+        assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
+        present_ids = set(
+            ExamAttempt.objects.filter(exam=exam).values_list('participant_id', flat=True)
+        )
+        participants = []
+        for ep in assigned:
+            p = ep.participant
+            participants.append({
+                'id': p.id,
+                'name': p.name,
+                'email': p.email,
+                'present': p.id in present_ids,
+            })
+        present_count = len(present_ids)
+        total_count = len(participants)
+        return Response({
+            'exam_id': exam.id,
+            'exam_title': exam.title,
+            'participants': participants,
+            'present_count': present_count,
+            'total_count': total_count,
+        })
 
 
 # Question Views
@@ -356,10 +624,18 @@ class ParticipantViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         exam_id = self.request.query_params.get('exam_id')
+        user = self.request.user
         if exam_id:
-            exam = Exam.objects.get(id=exam_id)
+            # Only return participants for exams owned by current user
+            try:
+                exam = Exam.objects.get(id=exam_id, created_by=user)
+            except Exam.DoesNotExist:
+                return Participant.objects.none()
             participant_ids = ExamParticipant.objects.filter(exam=exam).values_list('participant_id', flat=True)
             return Participant.objects.filter(id__in=participant_ids)
+        # No exam_id (e.g. /participants/ page): return all participants so the list
+        # shows every participant and which clicker_id is assigned (avoids "clicker id
+        # already assigned" when the assigning participant is not in the filtered list).
         return Participant.objects.all()
 
     @action(detail=False, methods=['post'])

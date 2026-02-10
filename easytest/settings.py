@@ -17,7 +17,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-this-in-production'
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,localhost:5174').split(',')
 
 # Application definition
 INSTALLED_APPS = [
@@ -35,6 +35,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -64,21 +65,29 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'easytest.wsgi.application'
 
-# Database
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.getenv('DB_NAME', 'easytest'),
-        'USER': os.getenv('DB_USER', 'root'),
-        'PASSWORD': os.getenv('DB_PASSWORD', ''),
-        'HOST': os.getenv('DB_HOST', '127.0.0.1'),  # Use 127.0.0.1 instead of localhost to force TCP
-        'PORT': os.getenv('DB_PORT', '3306'),
-        'OPTIONS': {
-            'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
-            'charset': 'utf8mb4',
-        },
+# Database - use SQLite when DB_ENGINE=sqlite (e.g. when MySQL is not running)
+if os.getenv('DB_ENGINE', '').lower() == 'sqlite':
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.mysql',
+            'NAME': os.getenv('DB_NAME', 'easytest'),
+            'USER': os.getenv('DB_USER', 'root'),
+            'PASSWORD': os.getenv('DB_PASSWORD', ''),
+            'HOST': os.getenv('DB_HOST', '127.0.0.1'),
+            'PORT': os.getenv('DB_PORT', '3306'),
+            'OPTIONS': {
+                'init_command': "SET sql_mode='STRICT_TRANS_TABLES'",
+                'charset': 'utf8mb4',
+            },
+        }
+    }
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -134,11 +143,21 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
-# CORS Settings
-CORS_ALLOWED_ORIGINS = os.getenv(
-    'CORS_ALLOWED_ORIGINS',
-    'http://localhost:5173,http://localhost:3000'
-).split(',')
+# CORS Settings - allow frontend dev servers (localhost and 127.0.0.1)
+_default_origins = [
+    'http://localhost:5173',
+    'http://localhost:5174',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:5174',
+    'http://127.0.0.1:3000',
+]
+CORS_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv(
+        'CORS_ALLOWED_ORIGINS',
+        ','.join(_default_origins)
+    ).split(',') if o.strip()
+] or _default_origins
 
 CORS_ALLOW_CREDENTIALS = True
 

@@ -211,6 +211,17 @@ class ParticipantSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'email', 'clicker_id', 'created_at']
         read_only_fields = ['id', 'created_at']
 
+    def validate_clicker_id(self, value):
+        if not value or not str(value).strip():
+            return value
+        value = str(value).strip()
+        qs = Participant.objects.filter(clicker_id=value)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError('Clicker ID already assigned.')
+        return value
+
 
 class ExamParticipantSerializer(serializers.ModelSerializer):
     participant = ParticipantSerializer(read_only=True)
