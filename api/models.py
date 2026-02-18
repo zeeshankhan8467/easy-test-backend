@@ -99,8 +99,9 @@ class ExamQuestion(models.Model):
 
 class Participant(models.Model):
     name = models.CharField(max_length=200)
-    email = models.EmailField(unique=True)
-    clicker_id = models.CharField(max_length=50, blank=True, null=True, unique=True)
+    email = models.EmailField(blank=True, null=True, unique=True)  # optional
+    clicker_id = models.CharField(max_length=50, unique=True)  # required
+    extra = models.JSONField(default=dict, blank=True, help_text='Custom fields: email, rollno, class, gender, etc.')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

@@ -208,18 +208,66 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
 class ParticipantSerializer(serializers.ModelSerializer):
     class Meta:
         model = Participant
-        fields = ['id', 'name', 'email', 'clicker_id', 'created_at']
+        fields = ['id', 'name', 'email', 'clicker_id', 'extra', 'created_at']
         read_only_fields = ['id', 'created_at']
+        extra_kwargs = {
+            'name': {'required': True},
+            'clicker_id': {'required': True},
+            'email': {'required': False, 'allow_blank': True},
+            'extra': {'required': False},
+        }
 
     def validate_clicker_id(self, value):
-        if not value or not str(value).strip():
-            return value
-        value = str(value).strip()
+        value = (value or '').strip()
+        if not value:
+            raise serializers.ValidationError('Clicker ID is required.')
         qs = Participant.objects.filter(clicker_id=value)
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
             raise serializers.ValidationError('Clicker ID already assigned.')
+        return value
+
+    def validate_name(self, value):
+        if not (value or '').strip():
+            raise serializers.ValidationError('Name is required.')
+        return (value or '').strip()
+
+    def validate_email(self, value):
+        return (value or '').strip() or None
+
+    def validate_extra(self, value):
+        if not isinstance(value, dict):
+            return {}
+        return {k: (v if v is None else str(v)) for k, v in value.items()}
+
+
+class ParticipantBulkCreateSerializer(serializers.Serializer):
+    """Accepts a list of participants with name and clicker_id (email optional)."""
+    participants = serializers.ListField(
+        child=serializers.DictField(),
+        min_length=1,
+        help_text='List of {name, clicker_id, email?}'
+    )
+
+    def validate_participants(self, value):
+        seen = set()
+        for i, item in enumerate(value):
+            name = (item.get('name') or '').strip()
+            clicker_id = (item.get('clicker_id') or '').strip()
+            if not name:
+                raise serializers.ValidationError(
+                    {'participants': f'Row {i + 1}: Name is required.'}
+                )
+            if not clicker_id:
+                raise serializers.ValidationError(
+                    {'participants': f'Row {i + 1}: Clicker ID is required.'}
+                )
+            if clicker_id in seen:
+                raise serializers.ValidationError(
+                    {'participants': f'Row {i + 1}: Duplicate clicker_id "{clicker_id}".'}
+                )
+            seen.add(clicker_id)
         return value
 
 
