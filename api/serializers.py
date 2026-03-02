@@ -46,7 +46,7 @@ class QuestionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Question
         fields = [
-            'id', 'text', 'type', 'options', 'correct_answer',
+            'id', 'text', 'type', 'options', 'correct_answer', 'option_display',
             'difficulty', 'tags', 'marks', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
