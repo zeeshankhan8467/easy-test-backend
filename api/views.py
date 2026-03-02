@@ -13,6 +13,7 @@ class BinaryFileRenderer(renderers.BaseRenderer):
     def render(self, data, accepted_media_type=None, renderer_context=None):
         return data if isinstance(data, bytes) else b''
 from django.db.models import Q, Count, Avg, Max, Min, Sum
+from django.db.models.functions import Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_GET
@@ -721,6 +722,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
             difficulty_col = get_col(df, 'difficulty')
             marks_col = get_col(df, 'marks', 'mark', 'points')
             tags_col = get_col(df, 'tags', 'tag')
+            option_display_col = get_col(df, 'option_display', 'option display', 'options format', 'label format')
 
             if text_col is None or options_col is None or correct_col is None:
                 return Response(
@@ -801,11 +803,21 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         if pd.notna(raw_tags) and str(raw_tags).strip():
                             tags_list = [t.strip() for t in str(raw_tags).split(',') if t.strip()]
 
+                    option_display = 'alpha'
+                    if option_display_col:
+                        raw_od = row.get(option_display_col, '')
+                        od = '' if pd.isna(raw_od) else str(raw_od).strip().lower()
+                        if od in ('numeric', 'number', 'num', '1'):
+                            option_display = 'numeric'
+                        elif od in ('alpha', 'letter', 'a', 'abc'):
+                            option_display = 'alpha'
+
                     Question.objects.create(
                         text=text,
                         type=qtype,
                         options=options,
                         correct_answer=correct_answer,
+                        option_display=option_display,
                         difficulty=diff,
                         tags=tags_list,
                         marks=marks_val
@@ -828,6 +840,8 @@ class ParticipantViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         exam_id = self.request.query_params.get('exam_id')
         user = self.request.user
+        # Order by clicker_id in natural order: 1, 2, ... 9, 10, 11, then alphanumeric (P007, S008, etc.)
+        base_order = [Length('clicker_id'), 'clicker_id']
         if exam_id:
             # Only return participants for exams owned by current user
             try:
@@ -835,11 +849,11 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             except Exam.DoesNotExist:
                 return Participant.objects.none()
             participant_ids = ExamParticipant.objects.filter(exam=exam).values_list('participant_id', flat=True)
-            return Participant.objects.filter(id__in=participant_ids)
+            return Participant.objects.filter(id__in=participant_ids).order_by(*base_order)
         # No exam_id (e.g. /participants/ page): return all participants so the list
         # shows every participant and which clicker_id is assigned (avoids "clicker id
         # already assigned" when the assigning participant is not in the filtered list).
-        return Participant.objects.all()
+        return Participant.objects.all().order_by(*base_order)
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
@@ -895,8 +909,8 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     return None
                 s = str(col_name).strip().lower()
                 COLUMN_TO_EXTRA_KEY = {
-                    'roll no': 'roll_no', 'roll no.': 'roll_no',
-                    'admission no': 'admission_no', 'admission no.': 'admission_no',
+                    'roll no': 'roll_no', 'roll no.': 'roll_no', 'roll number': 'roll_no', 'roll number.': 'roll_no',
+                    'admission no': 'admission_no', 'admission no.': 'admission_no', 'admission number': 'admission_no', 'admission number.': 'admission_no',
                     'class': 'class',
                     'subject': 'subject',
                     'section': 'section',
@@ -907,7 +921,7 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     'city': 'city',
                     'uid': 'uid',
                     'employee code': 'employee_code', 'employee code.': 'employee_code',
-                    'teacher name': 'teacher_name', 'teacher': 'teacher_name',
+                    'teacher name': 'teacher_name', 'teacher': 'teacher_name', 'teaccher name': 'teacher_name',
                     'email id': 'email_id', 'email': 'email_id', 'e-mail': 'email_id', 'email address': 'email_id',
                 }
                 return COLUMN_TO_EXTRA_KEY.get(s) or s.replace(' ', '_').replace('.', '').replace('-', '_') or None
@@ -919,12 +933,12 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                             return col
                 return None
             name_col = get_col(df, 'name', 'names', 'participant', 'participant name')
-            clicker_col = get_col(df, 'clicker_id', 'clicker id', 'clickerid', 'clicker')
+            clicker_col = get_col(df, 'clicker_id', 'clicker id', 'clickerid', 'clicker', 'keypad id', 'keypadid', 'keypad_id')
             email_col = get_col(df, 'email', 'e-mail', 'email address', 'email id')
             
             if name_col is None or clicker_col is None:
                 return Response(
-                    {'error': 'File must have at least "name" and "clicker_id" (or "clicker id") columns.'},
+                    {'error': 'File must have at least "Name" and "Clicker ID" (or "keypad id" / "clicker id") columns.'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
             reserved = {name_col, clicker_col, email_col} if email_col else {name_col, clicker_col}
@@ -955,6 +969,14 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     if not name or not clicker_id:
                         errors.append(f"Row {idx + 2}: Name and Clicker ID are required.")
                         continue
+                    
+                    # Avoid UNIQUE constraint on email: if this email is already used by another
+                    # participant (different clicker_id), keep it only in extra and set model email to None.
+                    if email:
+                        existing = Participant.objects.filter(email=email).exclude(clicker_id=clicker_id).first()
+                        if existing:
+                            extra['email_id'] = extra.get('email_id') or email
+                            email = None
                     
                     participant, created = Participant.objects.update_or_create(
                         clicker_id=clicker_id,
@@ -1130,6 +1152,16 @@ def exam_report(request, exam_id):
     return Response(serializer.data)
 
 
+def _format_question_options(question):
+    """Format question options for display: alpha (A. x, B. y) or numeric (1. x, 2. y)."""
+    opts = question.options or []
+    display = getattr(question, 'option_display', 'alpha')
+    if display == 'numeric':
+        return '\n'.join([f'{i + 1}. {opt}' for i, opt in enumerate(opts)])
+    # alpha: A, B, C, ...
+    return '\n'.join([f'{chr(65 + i)}. {opt}' for i, opt in enumerate(opts)])
+
+
 def _write_results_by_participants_detail_sheet(workbook, exam):
     """Write 'Results by Participants (Detail)' sheet: exam metadata + per-participant blocks with Question, Option, Type Correct Answer, Speed, Score."""
     # Excel sheet names cannot contain [ ] \ / * ? :
@@ -1187,7 +1219,7 @@ def _write_results_by_participants_detail_sheet(workbook, exam):
         # One row per exam question
         for eq in exam_questions:
             q = eq.question
-            options_text = '\n'.join([f'{i+1}. {opt}' for i, opt in enumerate(q.options or [])])
+            options_text = _format_question_options(q)
             answer = answer_map.get((attempt.id, q.id))
             if answer:
                 sel = answer.selected_answer
@@ -1286,7 +1318,7 @@ def _write_results_by_participants_individual(workbook, exam):
         # One row per question (match reference: Response = 1-based index, Slide Type = 'Choice', Correct Answer = 1-based correct index, Speed = decimal)
         for order_idx, eq in enumerate(exam_questions, start=1):
             q = eq.question
-            options_text = '\n'.join([f'{i+1}. {opt}' for i, opt in enumerate(q.options or [])])
+            options_text = _format_question_options(q)
             answer = answer_map.get((attempt.id, q.id))
             correct_idx = q.correct_answer
             if isinstance(correct_idx, list):

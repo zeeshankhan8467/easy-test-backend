@@ -61,10 +61,21 @@ class Question(models.Model):
         ('hard', 'Hard'),
     ]
 
+    OPTION_DISPLAY_CHOICES = [
+        ('alpha', 'A, B, C, D...'),
+        ('numeric', '1, 2, 3, 4...'),
+    ]
+
     text = models.TextField()
     type = models.CharField(max_length=20, choices=QUESTION_TYPES, default='mcq')
     options = models.JSONField(help_text="List of answer options")
     correct_answer = models.JSONField(help_text="Index or list of indices of correct answers")
+    option_display = models.CharField(
+        max_length=10,
+        choices=OPTION_DISPLAY_CHOICES,
+        default='alpha',
+        help_text='How to label options: A,B,C or 1,2,3'
+    )
     difficulty = models.CharField(max_length=10, choices=DIFFICULTY_LEVELS, default='medium')
     tags = models.JSONField(default=list, blank=True)
     marks = models.DecimalField(max_digits=5, decimal_places=2, default=1.0, help_text="Marks/points for this question")
@@ -105,7 +116,7 @@ class Participant(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ['name']
+        ordering = ['clicker_id']
 
     def __str__(self):
         return self.name
