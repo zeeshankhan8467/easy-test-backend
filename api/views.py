@@ -508,10 +508,28 @@ class QuestionViewSet(viewsets.ModelViewSet):
     serializer_class = QuestionSerializer
     permission_classes = [IsAuthenticated]
 
+    def _normalize_topic(self, raw: str) -> str:
+        """Ensure topic is a short label, not a full prompt (e.g. from mis-sent request)."""
+        if not raw:
+            return raw
+        topic = raw.strip()
+        # Reject prompt-like or overly long input: use only first line or first 200 chars
+        if len(topic) > 200 or topic.lower().startswith('you are ') or 'generate' in topic.lower()[:80]:
+            first_line = topic.split('\n')[0].strip()
+            if len(first_line) > 200:
+                topic = first_line[:200].strip()
+            else:
+                topic = first_line
+            # If it still looks like a prompt, use a safe fallback
+            if 'generate' in topic.lower() or topic.lower().startswith('you are'):
+                topic = 'General'
+        return topic[:200]
+
     @action(detail=False, methods=['post'])
     def generate(self, request):
         """Generate questions using AI"""
-        topic = request.data.get('topic', '').strip()
+        raw_topic = request.data.get('topic', '').strip()
+        topic = self._normalize_topic(raw_topic)
         count = int(request.data.get('count', 5))
         difficulty = request.data.get('difficulty', 'medium')
         qtype = request.data.get('type', 'mcq')
@@ -542,22 +560,19 @@ class QuestionViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            # Try AI generation - try Gemini first (free), then OpenAI
+            # Try AI generation: Groq first, then OpenAI
             ai_questions = []
-            
-            # Try Gemini (free tier) first
             try:
-                from api.services.ai_generator_gemini import GeminiQuestionGenerator
-                generator = GeminiQuestionGenerator()
+                from api.services.ai_generator_groq import GroqQuestionGenerator
+                generator = GroqQuestionGenerator()
                 ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
-            except (ValueError, ImportError) as e:
-                # Gemini not available, try OpenAI
+            except (ValueError, ImportError):
+                # Groq not available, try OpenAI
                 try:
                     from api.services.ai_generator import AIQuestionGenerator
                     generator = AIQuestionGenerator()
                     ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
                 except (ValueError, ImportError):
-                    # Neither available
                     pass
             
             # If AI generation succeeded and returned questions
@@ -622,15 +637,17 @@ class QuestionViewSet(viewsets.ModelViewSet):
     
     def _generate_mock_questions(self, topic: str, count: int, difficulty: str, qtype: str):
         """Fallback mock question generation"""
+        # Keep topic short for display (avoid prompt-sized strings)
+        safe_topic = (topic[:100] + '…') if len(topic) > 100 else topic
         generated_questions = []
         for i in range(count):
             question = Question.objects.create(
-                text=f"Sample question about {topic} - Question {i+1}",
+                text=f"Sample question about {safe_topic} - Question {i+1}",
                 type=qtype,
                 options=['Option A', 'Option B', 'Option C', 'Option D'] if qtype == 'mcq' else ['True', 'False'],
                 correct_answer=0 if qtype == 'mcq' else [0],
                 difficulty=difficulty,
-                tags=[topic],
+                tags=[safe_topic],
                 marks=1.0
             )
             generated_questions.append(QuestionSerializer(question).data)
