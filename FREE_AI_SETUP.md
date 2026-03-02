@@ -42,9 +42,14 @@ We now support **Google Gemini** which offers a **completely free tier** with no
 ### How It Works
 
 The system tries AI providers in this order:
-1. **Gemini** (if `GEMINI_API_KEY` is set) - FREE
-2. **OpenAI** (if `OPENAI_API_KEY` is set) - PAID
-3. **Mock/Sample** questions (if neither is available)
+1. **Groq** (if `GROQ_API_KEY` is set) – free tier available at https://console.groq.com
+2. **Gemini** (if `GEMINI_API_KEY` is set) – FREE
+3. **OpenAI** (if `OPENAI_API_KEY` is set) – PAID
+4. **Mock/Sample** questions (if none are available)
+
+When you run the backend, the server console will print which provider was used, e.g.:
+- `[EasyTest AI] Generated 5 questions using Groq for topic: ...`
+- `[EasyTest AI] No API key configured. Using sample questions. Add GROQ_API_KEY or GEMINI_API_KEY to .env`
 
 ### Get Your Free Gemini API Key
 
