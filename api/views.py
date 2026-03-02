@@ -560,23 +560,50 @@ class QuestionViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            # Try AI generation: Groq first, then OpenAI
+            # Try AI generation: Groq first, then Gemini (free), then OpenAI
             ai_questions = []
+            provider_used = None
             try:
                 from api.services.ai_generator_groq import GroqQuestionGenerator
                 generator = GroqQuestionGenerator()
                 ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
-            except (ValueError, ImportError):
-                # Groq not available, try OpenAI
+                if ai_questions:
+                    provider_used = 'Groq'
+            except (ValueError, ImportError) as e:
+                logger.info("AI generate: Groq not used (%s)", e)
+                pass
+
+            if not ai_questions:
+                try:
+                    from api.services.ai_generator_gemini import GeminiQuestionGenerator
+                    generator = GeminiQuestionGenerator()
+                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
+                    if ai_questions:
+                        provider_used = 'Gemini'
+                except (ValueError, ImportError) as e:
+                    logger.info("AI generate: Gemini not used (%s)", e)
+                    pass
+
+            if not ai_questions:
                 try:
                     from api.services.ai_generator import AIQuestionGenerator
                     generator = AIQuestionGenerator()
                     ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
-                except (ValueError, ImportError):
+                    if ai_questions:
+                        provider_used = 'OpenAI'
+                except (ValueError, ImportError) as e:
+                    logger.info("AI generate: OpenAI not used (%s)", e)
                     pass
-            
+
             # If AI generation succeeded and returned questions
             if ai_questions:
+                logger.info(
+                    "AI generate: %s generated %d questions for topic=%s",
+                    provider_used or "AI", len(ai_questions), topic[:50],
+                )
+                print(
+                    f"[EasyTest AI] Generated {len(ai_questions)} questions using {provider_used or 'AI'} for topic: {topic[:60]}..."
+                )
                 generated_questions = []
                 for q_data in ai_questions:
                     question = Question.objects.create(
@@ -592,39 +619,51 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 
                 return Response(generated_questions, status=status.HTTP_201_CREATED)
             else:
-                # Fallback to mock if AI fails
+                # Fallback to mock if AI fails or no provider configured
+                logger.warning(
+                    "AI generate: no provider available or all returned empty; using sample questions for topic=%s",
+                    topic[:50],
+                )
+                print(
+                    "[EasyTest AI] No API key configured or AI returned no questions. "
+                    "Using sample questions. For real AI: add GROQ_API_KEY or GEMINI_API_KEY to .env (see FREE_AI_SETUP.md)"
+                )
                 mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
                 return Response(
                     {
                         'questions': mock_data,
-                        'warning': 'AI generation unavailable. Sample questions generated. Please check OpenAI account quota or API key configuration.'
+                        'warning': 'AI generation unavailable. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI (see FREE_AI_SETUP.md).'
                     },
                     status=status.HTTP_201_CREATED
                 )
                 
         except ValueError as e:
             # API key not set - use mock
+            logger.warning("AI generate: ValueError (e.g. missing API key): %s", e)
+            print(
+                "[EasyTest AI] API key not set. Using sample questions. "
+                "Add GROQ_API_KEY or GEMINI_API_KEY to backend .env (see FREE_AI_SETUP.md)"
+            )
             mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
             return Response(
                 {
                     'questions': mock_data,
-                    'warning': 'OpenAI API key not configured. Sample questions generated.'
+                    'warning': 'API key not configured. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI.'
                 },
                 status=status.HTTP_201_CREATED
             )
         except Exception as e:
             # Any other error - use mock
-            import logging
-            logger = logging.getLogger(__name__)
             error_msg = str(e)
-            logger.error(f"AI generation error: {error_msg}")
+            logger.error("AI generation error: %s", error_msg)
+            print(f"[EasyTest AI] Error: {error_msg[:200]}. Using sample questions.")
             
             # Check for specific error types
             warning_msg = 'AI generation unavailable. Sample questions generated.'
             if 'quota' in error_msg.lower() or '429' in error_msg:
-                warning_msg = 'OpenAI account quota exceeded. Please add credits to your OpenAI account. Sample questions generated.'
+                warning_msg = 'API quota exceeded. Sample questions generated.'
             elif 'api key' in error_msg.lower() or '401' in error_msg:
-                warning_msg = 'Invalid OpenAI API key. Please check your API key configuration. Sample questions generated.'
+                warning_msg = 'Invalid API key. Sample questions generated.'
             
             mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
             return Response(
@@ -850,6 +889,29 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                 return Response({'error': 'Unsupported file format'}, status=status.HTTP_400_BAD_REQUEST)
             
             # Flexible column mapping: name and clicker_id required; email optional
+            # Normalize optional column headers to canonical keys for extra (matches frontend form)
+            def _normalize_col_key(col_name):
+                if col_name is None or (isinstance(col_name, float) and pd.isna(col_name)):
+                    return None
+                s = str(col_name).strip().lower()
+                COLUMN_TO_EXTRA_KEY = {
+                    'roll no': 'roll_no', 'roll no.': 'roll_no',
+                    'admission no': 'admission_no', 'admission no.': 'admission_no',
+                    'class': 'class',
+                    'subject': 'subject',
+                    'section': 'section',
+                    'team': 'team',
+                    'group': 'group',
+                    'house': 'house',
+                    'gender': 'gender',
+                    'city': 'city',
+                    'uid': 'uid',
+                    'employee code': 'employee_code', 'employee code.': 'employee_code',
+                    'teacher name': 'teacher_name', 'teacher': 'teacher_name',
+                    'email id': 'email_id', 'email': 'email_id', 'e-mail': 'email_id', 'email address': 'email_id',
+                }
+                return COLUMN_TO_EXTRA_KEY.get(s) or s.replace(' ', '_').replace('.', '').replace('-', '_') or None
+
             def get_col(df, *candidates):
                 for c in candidates:
                     for col in df.columns:
@@ -858,7 +920,7 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                 return None
             name_col = get_col(df, 'name', 'names', 'participant', 'participant name')
             clicker_col = get_col(df, 'clicker_id', 'clicker id', 'clickerid', 'clicker')
-            email_col = get_col(df, 'email', 'e-mail', 'email address')
+            email_col = get_col(df, 'email', 'e-mail', 'email address', 'email id')
             
             if name_col is None or clicker_col is None:
                 return Response(
@@ -883,7 +945,12 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                         if col not in reserved:
                             val = row.get(col)
                             if pd.notna(val) and val is not None and str(val).strip() not in ('', 'nan'):
-                                extra[str(col).strip()] = str(val).strip()
+                                key = _normalize_col_key(col)
+                                if key and key == 'email_id':
+                                    if email is None:
+                                        email = str(val).strip()
+                                elif key:
+                                    extra[key] = str(val).strip()
                     
                     if not name or not clicker_id:
                         errors.append(f"Row {idx + 2}: Name and Clicker ID are required.")
@@ -924,6 +991,53 @@ class ParticipantViewSet(viewsets.ModelViewSet):
 
 
 # Reports Views
+# Participant fields to include in report export (label for display, key in Participant.extra or model)
+PARTICIPANT_REPORT_FIELDS = [
+    ('Name', 'name'),
+    ('Clicker ID', 'clicker_id'),
+    ('Roll No.', 'roll_no'),
+    ('Admission No.', 'admission_no'),
+    ('Class', 'class'),
+    ('Subject', 'subject'),
+    ('Section', 'section'),
+    ('Team', 'team'),
+    ('Group', 'group'),
+    ('House', 'house'),
+    ('Gender', 'gender'),
+    ('City', 'city'),
+    ('UID', 'uid'),
+    ('Employee Code', 'employee_code'),
+    ('Teacher Name', 'teacher_name'),
+    ('Email ID', 'email_id'),
+]
+
+
+def _participant_report_row(participant):
+    """Build a dict of all participant user-data for report export (flat key -> value)."""
+    extra = participant.extra or {}
+    email_id = extra.get('email_id') or participant.email or ''
+    row = {
+        'name': participant.name or '',
+        'clicker_id': participant.clicker_id or '',
+        'email': participant.email or '',
+        'roll_no': extra.get('roll_no', ''),
+        'admission_no': extra.get('admission_no', ''),
+        'class': extra.get('class', ''),
+        'subject': extra.get('subject', ''),
+        'section': extra.get('section', ''),
+        'team': extra.get('team', ''),
+        'group': extra.get('group', ''),
+        'house': extra.get('house', ''),
+        'gender': extra.get('gender', ''),
+        'city': extra.get('city', ''),
+        'uid': extra.get('uid', ''),
+        'employee_code': extra.get('employee_code', ''),
+        'teacher_name': extra.get('teacher_name', ''),
+        'email_id': email_id,
+    }
+    return row
+
+
 def _get_exam_report_data(exam):
     """Build report data dict for an exam (no request needed). Used by exam_report and export."""
     attempts = ExamAttempt.objects.filter(exam=exam)
@@ -961,9 +1075,27 @@ def _get_exam_report_data(exam):
         })
     participant_results = []
     for attempt in attempts.order_by('-score', 'time_taken'):
+        p = attempt.participant
+        user_row = _participant_report_row(p)
         participant_results.append({
-            'participant_id': attempt.participant.id,
-            'participant_name': attempt.participant.name,
+            'participant_id': p.id,
+            'participant_name': p.name,
+            'clicker_id': user_row['clicker_id'],
+            'email': user_row['email'],
+            'roll_no': user_row['roll_no'],
+            'admission_no': user_row['admission_no'],
+            'class': user_row['class'],
+            'subject': user_row['subject'],
+            'section': user_row['section'],
+            'team': user_row['team'],
+            'group': user_row['group'],
+            'house': user_row['house'],
+            'gender': user_row['gender'],
+            'city': user_row['city'],
+            'uid': user_row['uid'],
+            'employee_code': user_row['employee_code'],
+            'teacher_name': user_row['teacher_name'],
+            'email_id': user_row['email_id'],
             'score': float(attempt.score),
             'total_questions': attempt.total_questions,
             'correct_answers': attempt.correct_answers,
@@ -1029,6 +1161,14 @@ def _write_results_by_participants_detail_sheet(workbook, exam):
     for attempt in attempts:
         participant = attempt.participant
         keypad = getattr(participant, 'clicker_id', None) or participant.name or str(participant.id)
+        user_row = _participant_report_row(participant)
+        # Participant details block (all user data)
+        for label, key in PARTICIPANT_REPORT_FIELDS:
+            val = user_row.get(key, '') or ''
+            ws.cell(row=row_num, column=1, value=label)
+            ws.cell(row=row_num, column=2, value=str(val))
+            row_num += 1
+        row_num += 1
         # Keypad No.
         ws.cell(row=row_num, column=1, value=f'Keypad No. {keypad}')
         ws.cell(row=row_num, column=1).font = bold_font
@@ -1106,6 +1246,7 @@ def _write_results_by_participants_individual(workbook, exam):
     for attempt in attempts:
         participant = attempt.participant
         keypad = getattr(participant, 'clicker_id', None) or str(participant.id)
+        user_row = _participant_report_row(participant)
         sheet_name = _sanitize_sheet_name(str(keypad))
         if sheet_name in workbook.sheetnames:
             del workbook[sheet_name]
@@ -1119,12 +1260,13 @@ def _write_results_by_participants_individual(workbook, exam):
         row += 1
         ws.cell(row=row, column=1, value=f'Questions Count: {n_questions}')
         row += 2
-        # Metadata placeholder rows (Sl No., Exam Unique Id, Exam Name, Theme, Faculty, Subject, Batch)
-        for label in ['Sl No.', 'Exam Unique Id', 'Exam Name', 'Theme', 'Faculty', 'Subject', 'Batch']:
+        # Participant details (all user data)
+        for label, key in PARTICIPANT_REPORT_FIELDS:
+            val = user_row.get(key, '') or ''
             ws.cell(row=row, column=1, value=label)
-            ws.cell(row=row, column=2, value='d')
+            ws.cell(row=row, column=2, value=str(val))
             row += 1
-        row += 2
+        row += 1
         # Keypad summary
         correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
         ws.cell(row=row, column=1, value=f'Keypad No. {keypad}')
