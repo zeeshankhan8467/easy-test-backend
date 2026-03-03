@@ -24,6 +24,7 @@ import json
 import logging
 from io import BytesIO
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 
@@ -529,11 +530,32 @@ class QuestionViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def generate(self, request):
         """Generate questions using AI"""
+        import re
         raw_topic = request.data.get('topic', '').strip()
         topic = self._normalize_topic(raw_topic)
         count = int(request.data.get('count', 5))
         difficulty = request.data.get('difficulty', 'medium')
         qtype = request.data.get('type', 'mcq')
+        # Optional: number of options per question (MCQ/multiple_select). Default 4; can parse from topic e.g. "with 10 options"
+        num_options = request.data.get('num_options')
+        if num_options is not None:
+            num_options = int(num_options)
+            if num_options < 2 or num_options > 15:
+                num_options = 4
+        else:
+            # Try to parse from topic: "with 10 options", "10 options", "class 6 math with 10 options"
+            match = re.search(r'(?:with\s+)?(\d+)\s*options?', raw_topic, re.IGNORECASE)
+            if match:
+                n = int(match.group(1))
+                if 2 <= n <= 15:
+                    num_options = n
+            if num_options is None:
+                num_options = 4
+        # If we parsed num_options from topic, strip that phrase so the topic is cleaner for the AI
+        if request.data.get('num_options') is None and re.search(r'(?:with\s+)?\d+\s*options?', raw_topic, re.IGNORECASE):
+            topic = re.sub(r'\s*with\s+\d+\s*options?\s*', ' ', topic, flags=re.IGNORECASE)
+            topic = re.sub(r'\s*\d+\s*options?\s*', ' ', topic, flags=re.IGNORECASE)
+            topic = re.sub(r'\s+', ' ', topic).strip() or topic
         
         # Validate inputs
         if not topic:
@@ -567,7 +589,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
             try:
                 from api.services.ai_generator_groq import GroqQuestionGenerator
                 generator = GroqQuestionGenerator()
-                ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
+                ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
                 if ai_questions:
                     provider_used = 'Groq'
             except (ValueError, ImportError) as e:
@@ -578,7 +600,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 try:
                     from api.services.ai_generator_gemini import GeminiQuestionGenerator
                     generator = GeminiQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
+                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
                     if ai_questions:
                         provider_used = 'Gemini'
                 except (ValueError, ImportError) as e:
@@ -589,7 +611,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 try:
                     from api.services.ai_generator import AIQuestionGenerator
                     generator = AIQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype)
+                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
                     if ai_questions:
                         provider_used = 'OpenAI'
                 except (ValueError, ImportError) as e:
@@ -1443,6 +1465,119 @@ def _write_results_by_questions_sheet(workbook, exam):
     ws.column_dimensions['C'].width = 14
 
 
+# Personal Achievement and Detail: one sheet with metadata + table of all assigned participants with keypad, name, roll_no, ..., Score, Correct Rate, Ranking, and per-question columns (1-S1, 2-S2, ...)
+PERSONAL_ACHIEVEMENT_HEADERS = [
+    'Keypad No.', 'Name', 'roll number', 'admission number', 'class', 'subject', 'section',
+    'team', 'group', 'house', 'gender', 'city', 'uid', 'employee code', 'teaccher name', 'Email ID',
+    'Score', 'Correct Rate', 'Ranking',
+]
+
+
+def _write_personal_achievement_and_detail_sheet(workbook, exam):
+    """Write 'Personal Achievement and Detail' sheet: title, Voted, exam info, then table of participants with details + score + per-question columns."""
+    sheet_name = 'Personal Achievement and Detail'
+    if sheet_name in workbook.sheetnames:
+        del workbook[sheet_name]
+    ws = workbook.create_sheet(sheet_name, 0)
+
+    exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
+    assigned = list(ExamParticipant.objects.filter(exam=exam).select_related('participant').order_by('participant__clicker_id'))
+    # Natural order by keypad id (1, 2, ... 9, 10, 11)
+    assigned.sort(key=lambda ep: (len(ep.participant.clicker_id or ''), ep.participant.clicker_id or ''))
+    attempts_by_participant = {a.participant_id: a for a in ExamAttempt.objects.filter(exam=exam).select_related('participant')}
+    answer_map = {}  # (attempt_id, question_id) -> Answer
+    for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
+        answer_map[(a.attempt_id, a.question_id)] = a
+
+    # Rank attempted by score (desc), then time (asc)
+    attempted_list = sorted(
+        [attempts_by_participant[ep.participant_id] for ep in assigned if ep.participant_id in attempts_by_participant],
+        key=lambda a: (-float(a.score), a.time_taken)
+    )
+    rank_by_attempt = {a.id: idx + 1 for idx, a in enumerate(attempted_list)}
+    voted_count = len(attempted_list)
+
+    row = 1
+    ws.cell(row=row, column=1, value='Personal Achievement and Detail')
+    ws.cell(row=row, column=1).font = Font(bold=True, size=14)
+    row += 1
+    ws.cell(row=row, column=1, value=f'Voted:{voted_count}')
+    row += 1
+    ws.cell(row=row, column=1, value=exam.title or '')
+    row += 1
+    ws.cell(row=row, column=1, value=timezone.now().strftime('%m/%d/%Y %H:%M'))
+    row += 1
+    for label, col_b in [
+        ('Sl No.', 'd'),
+        ('Exam Unique Id', str(exam.id)),
+        ('Exam Name', exam.title or ''),
+        ('Theme', 'd'),
+        ('Faculty', 'd'),
+        ('Subject', exam.title or ''),
+        ('Batch', 'd'),
+    ]:
+        ws.cell(row=row, column=1, value=label)
+        ws.cell(row=row, column=2, value=col_b)
+        row += 1
+    # Table header row
+    headers = list(PERSONAL_ACHIEVEMENT_HEADERS)
+    for order_idx, eq in enumerate(exam_questions, start=1):
+        headers.append(f'{order_idx}-S{order_idx}')
+    for col, h in enumerate(headers, 1):
+        ws.cell(row=row, column=col, value=h)
+    row += 1
+
+    for ep in assigned:
+        p = ep.participant
+        user_row = _participant_report_row(p)
+        attempt = attempts_by_participant.get(p.id)
+        if attempt:
+            score_val = float(attempt.score)
+            correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
+            rank_val = rank_by_attempt.get(attempt.id, '')
+        else:
+            score_val = 'ABSENT'
+            correct_rate = 0
+            rank_val = ''
+
+        col = 1
+        ws.cell(row=row, column=col, value=p.clicker_id or '')
+        col += 1
+        ws.cell(row=row, column=col, value=p.name or '')
+        col += 1
+        for key in ['roll_no', 'admission_no', 'class', 'subject', 'section', 'team', 'group', 'house', 'gender', 'city', 'uid', 'employee_code', 'teacher_name', 'email_id']:
+            ws.cell(row=row, column=col, value=user_row.get(key, '') or '')
+            col += 1
+        ws.cell(row=row, column=col, value=score_val)
+        col += 1
+        ws.cell(row=row, column=col, value=correct_rate if attempt else 0)
+        col += 1
+        ws.cell(row=row, column=col, value=rank_val)
+        col += 1
+        for eq in exam_questions:
+            if attempt:
+                ans = answer_map.get((attempt.id, eq.question_id))
+                if ans and ans.is_correct:
+                    q_score = float(eq.positive_marks)
+                elif ans:
+                    q_score = -float(eq.negative_marks)
+                else:
+                    q_score = None
+            else:
+                q_score = None
+            ws.cell(row=row, column=col, value=q_score if q_score is not None else '')
+            col += 1
+        row += 1
+
+    for c in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 14
+    # Remove default empty sheet if present
+    for default in ('Sheet', 'Sheet1'):
+        if default in workbook.sheetnames and len(workbook.sheetnames) > 1:
+            del workbook[default]
+            break
+
+
 def _answer_is_correct(selected, correct_answer):
     """Return True if selected answer matches correct_answer (int or list)."""
     if isinstance(correct_answer, list):
@@ -1451,20 +1586,24 @@ def _answer_is_correct(selected, correct_answer):
 
 
 def _build_export_http_response(request, exam):
-    """Build Excel or CSV download for exam report. Query param: format=excel|csv (case-insensitive, default excel). Returns DRF Response."""
+    """Build Excel or CSV download for exam report. Query param: format=excel|csv (case-insensitive, default excel). layout=personal_achievement for Personal Achievement sheet only."""
     raw = (request.query_params.get('format') or 'excel').strip().lower()
     format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
+    layout = (request.query_params.get('layout') or '').strip().lower()
     report_data = _get_exam_report_data(exam)
     df = pd.DataFrame(report_data['participant_results'])
     output = BytesIO()
     if format_type == 'excel':
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Participant Results', index=False)
-            qa_df = pd.DataFrame(report_data['question_analysis'])
-            qa_df.to_excel(writer, sheet_name='Question Analysis', index=False)
-            _write_results_by_participants_detail_sheet(writer.book, exam)
-        content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        filename = f'report-{exam.id}.xlsx'
+            if layout == 'personal_achievement':
+                _write_personal_achievement_and_detail_sheet(writer.book, exam)
+                filename = f'report-{exam.id}-personal-achievement.xlsx'
+            else:
+                df.to_excel(writer, sheet_name='Participant Results', index=False)
+                qa_df = pd.DataFrame(report_data['question_analysis'])
+                qa_df.to_excel(writer, sheet_name='Question Analysis', index=False)
+                _write_results_by_participants_detail_sheet(writer.book, exam)
+                filename = f'report-{exam.id}.xlsx'
     else:
         df.to_csv(output, index=False)
         content_type = 'text/csv'
@@ -1496,7 +1635,7 @@ export_report.renderer_classes = [BinaryFileRenderer]
 
 
 def _build_export_file_response(format_type, exam, layout=None):
-    """Build Excel or CSV as Django HttpResponse. layout='individual' => one sheet per participant; layout='questions' => Results by Questions."""
+    """Build Excel or CSV as Django HttpResponse. layout='individual' => one sheet per participant; layout='questions' => Results by Questions; layout='personal_achievement' => Personal Achievement and Detail."""
     report_data = _get_exam_report_data(exam)
     df = pd.DataFrame(report_data['participant_results'])
     output = BytesIO()
@@ -1514,6 +1653,9 @@ def _build_export_file_response(format_type, exam, layout=None):
                         del writer.book[default]
                         break
                 filename = f'report-{exam.id}-questions.xlsx'
+            elif layout_l == 'personal_achievement':
+                _write_personal_achievement_and_detail_sheet(writer.book, exam)
+                filename = f'report-{exam.id}-personal-achievement.xlsx'
             else:
                 df.to_excel(writer, sheet_name='Participant Results', index=False)
                 qa_df = pd.DataFrame(report_data['question_analysis'])
