@@ -49,7 +49,7 @@ class GeminiQuestionGenerator:
             self.model = genai.GenerativeModel('gemini-pro')
             self.model_name = 'gemini-pro'
     
-    def _build_prompt(self, topic: str, count: int, difficulty: str, qtype: str) -> str:
+    def _build_prompt(self, topic: str, count: int, difficulty: str, qtype: str, num_options: int = 4) -> str:
         """Build a prompt for AI question generation"""
         
         difficulty_description = {
@@ -58,23 +58,28 @@ class GeminiQuestionGenerator:
             'hard': 'advanced concepts requiring deep understanding and critical thinking'
         }
         
-        question_type_instructions = {
-            'mcq': """Generate Multiple Choice Questions (MCQ) with exactly 4 options each.
+        n_opts = max(2, min(15, num_options)) if qtype == 'mcq' else 4
+        mcq_instruction = f"""Generate Multiple Choice Questions (MCQ) with exactly {n_opts} options each.
             Format each question as JSON with:
             - "question": The question text in HTML format (use <p>, <strong>, <em>, <u> tags for formatting)
-            - "options": Array of exactly 4 options [option1, option2, option3, option4]
-            - "correct_answer": Index of correct answer (0-3)
+            - "options": Array of exactly {n_opts} options. One clearly correct; others plausible distractors.
+            - "correct_answer": Index of correct answer (0 to {n_opts - 1})
             - "marks": Number (default 1.0, can be 0.5, 1.0, 1.5, 2.0, etc.)
             - "explanation": Brief explanation of why the answer is correct
             
-            Example question format:
-            {
+            You MUST use exactly {n_opts} options in the "options" array for each question.
+            
+            Example question format (with 4 options):
+            {{
               "question": "<p>What is the <strong>primary purpose</strong> of Python's <em>if</em> statement?</p>",
               "options": ["To define a function", "To make decisions based on conditions", "To loop through data", "To import modules"],
               "correct_answer": 1,
               "marks": 1.0,
               "explanation": "The if statement is used for conditional execution"
-            }""",
+            }}"""
+        
+        question_type_instructions = {
+            'mcq': mcq_instruction,
             
             'true_false': """Generate True/False questions.
             Format each question as JSON with:
@@ -132,7 +137,7 @@ IMPORTANT FORMATTING RULES:
 - Question text MUST be in HTML format (wrap in <p> tags)
 - Use <strong> for important terms, <em> for emphasis
 - Marks should be numbers (0.5, 1.0, 1.5, 2.0, etc.)
-- For MCQ: correct_answer is a single number (0-3)
+- For MCQ: correct_answer is a single number (0 to number of options minus 1)
 - For True/False: correct_answer is 0 (True) or 1 (False)
 - For Multiple Select: correct_answer is an array like [0, 2]
 
@@ -141,7 +146,7 @@ Generate {count} questions now. Return only the JSON array:"""
         
         return prompt
     
-    def generate_questions(self, topic: str, count: int, difficulty: str, qtype: str) -> List[Dict[str, Any]]:
+    def generate_questions(self, topic: str, count: int, difficulty: str, qtype: str, num_options: int = 4) -> List[Dict[str, Any]]:
         """
         Generate questions using Google Gemini
         
@@ -150,12 +155,13 @@ Generate {count} questions now. Return only the JSON array:"""
             count: Number of questions to generate
             difficulty: easy, medium, or hard
             qtype: mcq, true_false, or multiple_select
+            num_options: For MCQ, number of options per question (2-15, default 4)
             
         Returns:
             List of question dictionaries with: question, options, correct_answer, explanation
         """
         try:
-            prompt = self._build_prompt(topic, count, difficulty, qtype)
+            prompt = self._build_prompt(topic, count, difficulty, qtype, num_options)
             
             response = self.model.generate_content(
                 prompt,
@@ -266,12 +272,12 @@ Generate {count} questions now. Return only the JSON array:"""
         except Exception as e:
             raise Exception(f"AI generation failed: {str(e)}")
     
-    def generate_questions_safe(self, topic: str, count: int, difficulty: str, qtype: str) -> List[Dict[str, Any]]:
+    def generate_questions_safe(self, topic: str, count: int, difficulty: str, qtype: str, num_options: int = 4) -> List[Dict[str, Any]]:
         """
         Safe wrapper that falls back to empty list if AI fails
         """
         try:
-            return self.generate_questions(topic, count, difficulty, qtype)
+            return self.generate_questions(topic, count, difficulty, qtype, num_options)
         except Exception as e:
             # Log error but don't crash - return empty list
             import logging

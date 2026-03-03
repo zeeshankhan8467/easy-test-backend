@@ -50,7 +50,7 @@ class GroqQuestionGenerator:
             base_url=GROQ_BASE_URL,
         )
 
-    def _build_prompt(self, topic: str, count: int, difficulty: str, qtype: str) -> str:
+    def _build_prompt(self, topic: str, count: int, difficulty: str, qtype: str, num_options: int = 4) -> str:
         """Build an exam-level prompt for AI question generation."""
         difficulty_description = {
             "easy": "basic, recall-level concepts suitable for beginners",
@@ -61,16 +61,20 @@ class GroqQuestionGenerator:
             difficulty, difficulty_description["medium"]
         )
 
-        question_type_instructions = {
-            "mcq": """Generate Multiple Choice Questions (MCQ) with exactly 4 options each.
+        n_opts = max(2, min(15, num_options)) if qtype == "mcq" else 4
+        mcq_instruction = f"""Generate Multiple Choice Questions (MCQ) with exactly {n_opts} options each.
 - "question": Question text in HTML (use <p>, <strong>, <em>, <u> only). One clear stem, exam-style.
-- "options": Array of exactly 4 options [A, B, C, D]. One clearly correct; others plausible distractors.
-- "correct_answer": Index of correct option (0-3).
+- "options": Array of exactly {n_opts} options. One clearly correct; others plausible distractors.
+- "correct_answer": Index of correct option (0 to {n_opts - 1}).
 - "marks": Number (e.g. 0.5, 1.0, 1.5, 2.0).
 - "explanation": Brief, factual explanation of the correct answer.
 
-Example:
-{"question": "<p>What is the <strong>primary purpose</strong> of an <em>if</em> statement?</p>", "options": ["Define a function", "Make decisions based on conditions", "Loop through data", "Import modules"], "correct_answer": 1, "marks": 1.0, "explanation": "The if statement is used for conditional execution."}""",
+Example (4 options):
+{{"question": "<p>What is the <strong>primary purpose</strong> of an <em>if</em> statement?</p>", "options": ["Define a function", "Make decisions based on conditions", "Loop through data", "Import modules"], "correct_answer": 1, "marks": 1.0, "explanation": "The if statement is used for conditional execution."}}
+You MUST use exactly {n_opts} options in the "options" array for each question."""
+
+        question_type_instructions = {
+            "mcq": mcq_instruction,
             "true_false": """Generate True/False questions.
 - "question": Statement in HTML. Must be unambiguously true or false.
 - "options": ["True", "False"]
@@ -105,7 +109,7 @@ Rules:
 - Topic: every question must clearly relate to "{topic}".
 - HTML only: <p>, <strong>, <em>, <u>. Wrap each question in <p>.
 - Marks: use numbers (0.5, 1.0, 1.5, 2.0) by difficulty.
-- For MCQ: correct_answer is a single integer 0-3. For True/False: 0 or 1. For multiple_select: array of indices e.g. [0, 2].
+- For MCQ: correct_answer is a single integer 0 to (number of options minus 1). For True/False: 0 or 1. For multiple_select: array of indices e.g. [0, 2].
 
 Output ONLY a valid JSON array of {count} question objects. No markdown, no code fences, no extra text.
 [
@@ -163,7 +167,7 @@ Output ONLY a valid JSON array of {count} question objects. No markdown, no code
         )
 
     def generate_questions(
-        self, topic: str, count: int, difficulty: str, qtype: str
+        self, topic: str, count: int, difficulty: str, qtype: str, num_options: int = 4
     ) -> List[Dict[str, Any]]:
         """
         Generate questions using Groq API.
@@ -173,11 +177,12 @@ Output ONLY a valid JSON array of {count} question objects. No markdown, no code
             count: Number of questions (1-20)
             difficulty: easy, medium, or hard
             qtype: mcq, true_false, or multiple_select
+            num_options: For MCQ, number of options per question (2-15, default 4)
 
         Returns:
             List of dicts with: text, options, correct_answer, explanation, difficulty, tags, marks
         """
-        prompt = self._build_prompt(topic, count, difficulty, qtype)
+        prompt = self._build_prompt(topic, count, difficulty, qtype, num_options)
 
         response = self.client.chat.completions.create(
             model=self.model,
@@ -245,11 +250,11 @@ Output ONLY a valid JSON array of {count} question objects. No markdown, no code
         return formatted
 
     def generate_questions_safe(
-        self, topic: str, count: int, difficulty: str, qtype: str
+        self, topic: str, count: int, difficulty: str, qtype: str, num_options: int = 4
     ) -> List[Dict[str, Any]]:
         """Safe wrapper: returns empty list on any failure."""
         try:
-            return self.generate_questions(topic, count, difficulty, qtype)
+            return self.generate_questions(topic, count, difficulty, qtype, num_options)
         except Exception as e:
             logger.exception("Groq AI generation error: %s", e)
             return []
