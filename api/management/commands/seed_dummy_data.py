@@ -1,10 +1,10 @@
 """
 Seed dummy data for all EasyTest features: users, participants, questions, exams,
 exam-question/participant links, attempts, and answers.
+Uses simple, predictable data so you can verify all values (e.g. Student 1 → roll 1, clicker_id 1).
 Run: python manage.py seed_dummy_data
 Use --clear to remove existing dummy data first (optional).
 """
-import random
 import hashlib
 import json as json_lib
 from decimal import Decimal
@@ -18,65 +18,42 @@ from api.models import (
 )
 
 
-# ─── Participants: all fields (name, clicker_id, email + extra) ─────────────────
-# Each dict: name, clicker_id, email, and optional fields for extra (roll_no, admission_no, class, etc.)
+# ─── Participants: simple data for easy verification ─────────────────────────
+# Each has obvious values: Student 1 → roll 1, clicker_id 1, class 6, etc.
 PARTICIPANTS_DATA = [
-    {"name": "Alice Smith", "clicker_id": "P001", "email": "alice.smith@example.com", "roll_no": "1", "admission_no": "ADM001", "class": "6", "subject": "Math", "section": "A", "team": "Alpha", "group": "G1", "house": "Red", "gender": "Female", "city": "Mumbai", "uid": "UID001", "employee_code": "", "teacher_name": "Mr. Kumar", "email_id": "alice.smith@example.com"},
-    {"name": "Bob Jones", "clicker_id": "P002", "email": "bob.jones@example.com", "roll_no": "2", "admission_no": "ADM002", "class": "6", "subject": "Science", "section": "A", "team": "Alpha", "group": "G1", "house": "Blue", "gender": "Male", "city": "Delhi", "uid": "UID002", "employee_code": "", "teacher_name": "Mrs. Sharma", "email_id": "bob.jones@example.com"},
-    {"name": "Carol White", "clicker_id": "P003", "email": "carol.white@example.com", "roll_no": "3", "admission_no": "ADM003", "class": "7", "subject": "English", "section": "B", "team": "Beta", "group": "G2", "house": "Green", "gender": "Female", "city": "Bangalore", "uid": "UID003", "employee_code": "", "teacher_name": "Mr. Patel", "email_id": "carol.white@example.com"},
-    {"name": "David Brown", "clicker_id": "P004", "email": "david.brown@example.com", "roll_no": "4", "admission_no": "ADM004", "class": "7", "subject": "History", "section": "B", "team": "Beta", "group": "G2", "house": "Yellow", "gender": "Male", "city": "Chennai", "uid": "UID004", "employee_code": "", "teacher_name": "Ms. Reddy", "email_id": "david.brown@example.com"},
-    {"name": "Eve Davis", "clicker_id": "P005", "email": "eve.davis@example.com", "roll_no": "5", "admission_no": "ADM005", "class": "8", "subject": "Geography", "section": "A", "team": "Gamma", "group": "G3", "house": "Red", "gender": "Female", "city": "Hyderabad", "uid": "UID005", "employee_code": "", "teacher_name": "Mr. Kumar", "email_id": "eve.davis@example.com"},
-    {"name": "Frank Miller", "clicker_id": "P006", "email": "frank.miller@example.com", "roll_no": "6", "admission_no": "ADM006", "class": "8", "subject": "Math", "section": "A", "team": "Gamma", "group": "G3", "house": "Blue", "gender": "Male", "city": "Pune", "uid": "UID006", "employee_code": "EMP006", "teacher_name": "Mrs. Sharma", "email_id": "frank.miller@example.com"},
-    {"name": "Grace Lee", "clicker_id": "P007", "email": "grace.lee@example.com", "roll_no": "7", "admission_no": "ADM007", "class": "9", "subject": "Science", "section": "C", "team": "Delta", "group": "G4", "house": "Green", "gender": "Female", "city": "Kolkata", "uid": "UID007", "employee_code": "", "teacher_name": "Mr. Patel", "email_id": "grace.lee@example.com"},
-    {"name": "Henry Wilson", "clicker_id": "P008", "email": "henry.wilson@example.com", "roll_no": "8", "admission_no": "ADM008", "class": "9", "subject": "Computer", "section": "C", "team": "Delta", "group": "G4", "house": "Yellow", "gender": "Male", "city": "Ahmedabad", "uid": "UID008", "employee_code": "", "teacher_name": "Ms. Reddy", "email_id": "henry.wilson@example.com"},
-    {"name": "Ivy Taylor", "clicker_id": "P009", "email": "ivy.taylor@example.com", "roll_no": "9", "admission_no": "ADM009", "class": "10", "subject": "Physics", "section": "A", "team": "Alpha", "group": "G1", "house": "Red", "gender": "Female", "city": "Jaipur", "uid": "UID009", "employee_code": "", "teacher_name": "Mr. Kumar", "email_id": "ivy.taylor@example.com"},
-    {"name": "Jack Anderson", "clicker_id": "P010", "email": "jack.anderson@example.com", "roll_no": "10", "admission_no": "ADM010", "class": "10", "subject": "Chemistry", "section": "A", "team": "Alpha", "group": "G1", "house": "Blue", "gender": "Male", "city": "Lucknow", "uid": "UID010", "employee_code": "EMP010", "teacher_name": "Mrs. Sharma", "email_id": "jack.anderson@example.com"},
-    {"name": "Kate Martinez", "clicker_id": "P011", "email": "kate.m@example.com", "roll_no": "11", "admission_no": "ADM011", "class": "6", "subject": "Hindi", "section": "B", "team": "Beta", "group": "G2", "house": "Green", "gender": "Female", "city": "Mumbai", "uid": "UID011", "employee_code": "", "teacher_name": "Mr. Patel", "email_id": "kate.m@example.com"},
-    {"name": "Leo Garcia", "clicker_id": "P012", "email": "leo.g@example.com", "roll_no": "12", "admission_no": "ADM012", "class": "7", "subject": "Math", "section": "B", "team": "Beta", "group": "G2", "house": "Yellow", "gender": "Male", "city": "Delhi", "uid": "UID012", "employee_code": "", "teacher_name": "Ms. Reddy", "email_id": "leo.g@example.com"},
-    {"name": "Mia Robinson", "clicker_id": "P013", "email": "mia.r@example.com", "roll_no": "13", "admission_no": "ADM013", "class": "8", "subject": "Biology", "section": "A", "team": "Gamma", "group": "G3", "house": "Red", "gender": "Female", "city": "Bangalore", "uid": "UID013", "employee_code": "", "teacher_name": "Mr. Kumar", "email_id": "mia.r@example.com"},
-    {"name": "Noah Clark", "clicker_id": "P014", "email": "noah.c@example.com", "roll_no": "14", "admission_no": "ADM014", "class": "9", "subject": "English", "section": "C", "team": "Delta", "group": "G4", "house": "Blue", "gender": "Male", "city": "Chennai", "uid": "UID014", "employee_code": "EMP014", "teacher_name": "Mrs. Sharma", "email_id": "noah.c@example.com"},
-    {"name": "Olivia Lewis", "clicker_id": "P015", "email": "olivia.l@example.com", "roll_no": "15", "admission_no": "ADM015", "class": "10", "subject": "Economics", "section": "A", "team": "Alpha", "group": "G1", "house": "Green", "gender": "Female", "city": "Hyderabad", "uid": "UID015", "employee_code": "", "teacher_name": "Mr. Patel", "email_id": "olivia.l@example.com"},
+    {"name": "Student 1", "clicker_id": "1", "email": "student1@test.com", "roll_no": "1", "admission_no": "ADM001", "class": "6", "section": "A", "teacher_name": "Teacher A"},
+    {"name": "Student 2", "clicker_id": "2", "email": "student2@test.com", "roll_no": "2", "admission_no": "ADM002", "class": "6", "section": "A", "teacher_name": "Teacher A"},
+    {"name": "Student 3", "clicker_id": "3", "email": "student3@test.com", "roll_no": "3", "admission_no": "ADM003", "class": "6", "section": "B", "teacher_name": "Teacher B"},
+    {"name": "Student 4", "clicker_id": "4", "email": "student4@test.com", "roll_no": "4", "admission_no": "ADM004", "class": "7", "section": "A", "teacher_name": "Teacher B"},
+    {"name": "Student 5", "clicker_id": "5", "email": "student5@test.com", "roll_no": "5", "admission_no": "ADM005", "class": "7", "section": "B", "teacher_name": "Teacher A"},
 ]
-# Optional field keys stored in Participant.extra (excluding name, clicker_id, email which are model fields)
 EXTRA_KEYS = ["roll_no", "admission_no", "class", "subject", "section", "team", "group", "house", "gender", "city", "uid", "employee_code", "teacher_name", "email_id"]
 
-# ─── Question bank: (text, type, options, correct_answer, difficulty) ─────── (text, type, options, correct_answer, difficulty) ───────
+# ─── Question bank: simple data for easy verification ─────────────────────
+# Each tuple: (text, type, options, correct_answer, difficulty, option_display)
+# correct_answer: single index for mcq/true_false, list of indices for multiple_select
 QUESTIONS_BANK = [
-    # MCQ easy
-    ("What is 2 + 2?", "mcq", ["2", "3", "4", "5"], 2, "easy"),
-    ("Capital of France?", "mcq", ["London", "Berlin", "Paris", "Madrid"], 2, "easy"),
-    ("How many continents are there?", "mcq", ["5", "6", "7", "8"], 2, "easy"),
-    ("Which planet is closest to the Sun?", "mcq", ["Venus", "Mercury", "Earth", "Mars"], 1, "easy"),
-    ("What is the largest ocean?", "mcq", ["Atlantic", "Indian", "Arctic", "Pacific"], 3, "easy"),
-    # MCQ medium
-    ("What does CPU stand for?", "mcq", ["Central Processing Unit", "Computer Personal Unit", "Central Program Utility", "Core Processing Unit"], 0, "medium"),
-    ("Which language is used for web styling?", "mcq", ["Python", "CSS", "SQL", "Java"], 1, "medium"),
-    ("In which year did World War II end?", "mcq", ["1943", "1944", "1945", "1946"], 2, "medium"),
-    ("What is the chemical symbol for gold?", "mcq", ["Go", "Gd", "Au", "Ag"], 2, "medium"),
-    ("Which organ pumps blood?", "mcq", ["Lungs", "Liver", "Heart", "Kidney"], 2, "medium"),
-    # MCQ hard
-    ("What is the time complexity of binary search?", "mcq", ["O(n)", "O(log n)", "O(n^2)", "O(1)"], 1, "hard"),
-    ("Who wrote 'Romeo and Juliet'?", "mcq", ["Charles Dickens", "William Shakespeare", "Jane Austen", "Mark Twain"], 1, "hard"),
+    # MCQ with alpha labels (A, B, C, D) — correct is index 0 = first option
+    ("What is 1 + 1?", "mcq", ["1", "2", "3", "4"], 1, "easy", "alpha"),
+    ("What is 2 + 2?", "mcq", ["2", "3", "4", "5"], 2, "easy", "alpha"),
+    ("Capital of India?", "mcq", ["Mumbai", "Delhi", "Kolkata", "Chennai"], 1, "easy", "alpha"),
+    # MCQ with numeric labels (1, 2, 3, 4)
+    ("How many days in a week?", "mcq", ["5", "6", "7", "8"], 2, "easy", "numeric"),
+    ("Which is the largest number?", "mcq", ["10", "20", "30", "40"], 3, "easy", "numeric"),
     # True/False
-    ("Python is a programming language.", "true_false", ["True", "False"], 0, "easy"),
-    ("Water boils at 100°C at sea level.", "true_false", ["True", "False"], 0, "easy"),
-    ("HTML is a programming language.", "true_false", ["True", "False"], 1, "medium"),
-    ("The Earth is flat.", "true_false", ["True", "False"], 1, "easy"),
-    ("Light travels faster than sound.", "true_false", ["True", "False"], 0, "medium"),
-    ("Django is a Python web framework.", "true_false", ["True", "False"], 0, "medium"),
+    ("The sky is blue.", "true_false", ["True", "False"], 0, "easy", "alpha"),
+    ("2 + 2 = 5.", "true_false", ["True", "False"], 1, "easy", "alpha"),
+    ("Django is a Python framework.", "true_false", ["True", "False"], 0, "medium", "alpha"),
     # Multiple select
-    ("Which are even numbers?", "multiple_select", ["2", "3", "4", "5"], [0, 2], "medium"),
-    ("Which are primary colors?", "multiple_select", ["Red", "Green", "Blue", "Yellow"], [0, 1, 2], "medium"),
-    ("Which are programming languages?", "multiple_select", ["Python", "HTML", "Java", "CSS"], [0, 2], "medium"),
-    ("Which are continents?", "multiple_select", ["Asia", "Europe", "Pacific", "Africa"], [0, 1, 3], "easy"),
+    ("Which are even numbers? (select two)", "multiple_select", ["2", "3", "4", "5"], [0, 2], "easy", "alpha"),
+    ("Which are vowels? (select two)", "multiple_select", ["A", "B", "E", "F"], [0, 2], "easy", "numeric"),
 ]
 
-# ─── Exam definitions: (title, description, duration_mins, revisable, status) ───
+# ─── Exam definitions: (title, description, duration_sec_per_question, revisable, status) ───
 EXAMS_CONFIG = [
-    ("Math & Science Quiz", "Basic math and science questions for class 6.", 20, True, "draft"),
-    ("Dummy Exam for Reports", "Seed data for testing reports, leaderboard and analytics.", 30, True, "frozen"),
-    ("History & Geography", "World history and geography assessment.", 25, True, "frozen"),
-    ("CS Fundamentals", "Computer science and general knowledge.", 15, False, "completed"),
+    ("Simple Draft Exam", "Draft exam for testing. 3 questions, 10 sec per question.", 10, True, "draft"),
+    ("Simple Frozen Exam", "Frozen exam for reports. 5 questions, 15 sec per question.", 15, True, "frozen"),
+    ("Simple Completed Exam", "Completed exam with attempts. 4 questions, 10 sec per question.", 10, False, "completed"),
 ]
 
 
@@ -135,7 +112,8 @@ def create_participants(stdout):
 def create_questions(stdout):
     created = []
     question_texts = [x[0] for x in QUESTIONS_BANK]
-    for text, qtype, options, correct_answer, difficulty in QUESTIONS_BANK:
+    for row in QUESTIONS_BANK:
+        text, qtype, options, correct_answer, difficulty, option_display = row
         q, is_new = Question.objects.get_or_create(
             text=text,
             defaults={
@@ -143,7 +121,8 @@ def create_questions(stdout):
                 "options": options,
                 "correct_answer": correct_answer,
                 "difficulty": difficulty,
-                "tags": ["dummy", qtype, difficulty],
+                "option_display": option_display,
+                "tags": ["seed", qtype, difficulty],
                 "marks": Decimal("1.0"),
             }
         )
@@ -185,8 +164,11 @@ def freeze_exam_with_snapshot(exam, exam_questions):
 
 
 def create_attempts_and_answers(exam, participants, exam_questions, stdout):
+    """Create attempts with deterministic answers so scores can be verified.
+    Participant 0: all correct. Participant 1: first 2 correct, rest wrong. Participant 2: all wrong. etc.
+    """
     n_q = len(exam_questions)
-    for p in participants:
+    for p_idx, p in enumerate(participants):
         attempt, _ = ExamAttempt.objects.get_or_create(
             exam=exam,
             participant=p,
@@ -205,16 +187,18 @@ def create_attempts_and_answers(exam, participants, exam_questions, stdout):
 
         correct_count = 0
         wrong_count = 0
-        total_time = 0
         total_marks = Decimal("0")
 
-        for eq in exam_questions:
+        for q_idx, eq in enumerate(exam_questions):
             q = eq.question
             correct = q.correct_answer
             options_count = len(q.options)
-            if random.random() < 0.65:
+            # Deterministic: participant 0 = all correct, 1 = first 2 correct, 2 = first 1 correct, etc.
+            num_correct_for_this_participant = max(0, n_q - p_idx)
+            is_correct = q_idx < num_correct_for_this_participant
+
+            if is_correct:
                 selected = correct
-                is_correct = True
                 correct_count += 1
                 total_marks += eq.positive_marks
             else:
@@ -222,13 +206,14 @@ def create_attempts_and_answers(exam, participants, exam_questions, stdout):
                     wrong_indices = [i for i in range(options_count) if i not in correct]
                     selected = [wrong_indices[0]] if wrong_indices else [0]
                 else:
-                    wrong_idx = random.choice([i for i in range(options_count) if i != correct])
+                    wrong_idx = (correct + 1) % max(options_count, 1)
+                    if wrong_idx == correct and options_count > 1:
+                        wrong_idx = 0
                     selected = wrong_idx
-                is_correct = False
                 wrong_count += 1
                 total_marks -= eq.negative_marks
-            time_q = random.randint(5, 90)
-            total_time += time_q
+
+            time_q = 10 + (q_idx * 5)  # 10, 15, 20, ... seconds per question
             Answer.objects.create(
                 attempt=attempt,
                 question=q,
@@ -241,7 +226,7 @@ def create_attempts_and_answers(exam, participants, exam_questions, stdout):
         attempt.wrong_answers = wrong_count
         attempt.unattempted = n_q - correct_count - wrong_count
         attempt.score = max(Decimal("0"), total_marks)
-        attempt.time_taken = total_time
+        attempt.time_taken = sum(10 + (i * 5) for i in range(n_q))
         attempt.submitted_at = timezone.now()
         attempt.save()
 
@@ -275,7 +260,7 @@ class Command(BaseCommand):
             Exam.objects.filter(title__in=dummy_titles, created_by=user).delete()
             self.stdout.write(self.style.WARNING(f"Cleared {deleted_exams} dummy exam(s)."))
 
-        if options.get("skip_existing") and Exam.objects.filter(title="Dummy Exam for Reports", created_by=user).exists():
+        if options.get("skip_existing") and Exam.objects.filter(title="Simple Frozen Exam", created_by=user).exists():
             self.stdout.write("Dummy data already exists (--skip-existing). Done.")
             return
 
@@ -305,9 +290,14 @@ class Command(BaseCommand):
             if not exam_created and options.get("skip_existing"):
                 continue
 
-            # Assign a subset of questions (e.g. 6–10 per exam)
-            n_questions_for_exam = min(random.randint(6, 12), len(question_pool))
-            chosen = random.sample(question_pool, n_questions_for_exam)
+            # Assign questions deterministically: draft=first 3, frozen=first 5, completed=first 4
+            if "Draft" in title:
+                n_questions_for_exam = 3
+            elif "Frozen" in title:
+                n_questions_for_exam = 5
+            else:
+                n_questions_for_exam = 4
+            chosen = list(question_pool)[:n_questions_for_exam]
 
             for order, q in enumerate(chosen):
                 ExamQuestion.objects.get_or_create(
@@ -330,10 +320,10 @@ class Command(BaseCommand):
                     )
                 exam_questions = list(exam.exam_questions.select_related("question").order_by("order"))
 
-            # Assign participants
-            assign = participants[: random.randint(8, len(participants))]
-            for p in assign:
+            # Assign all participants to each exam (simple: same 5 for all)
+            for p in participants:
                 ExamParticipant.objects.get_or_create(exam=exam, participant=p)
+            assign = list(participants)
 
             # Freeze/completed exams: set snapshot and create attempts
             if status in ("frozen", "completed"):
@@ -344,6 +334,6 @@ class Command(BaseCommand):
                 create_attempts_and_answers(exam, assign, exam_questions, self.stdout)
 
         self.stdout.write(self.style.SUCCESS(
-            "Done. You now have: Participants list, Question bank, multiple Exams (draft/frozen/completed), "
-            "Reports and Leaderboard data. Open Dashboard, Reports and Leaderboard in the app."
+            "Done. Simple seed data created. Verify: Participants (Student 1–5, clicker_id 1–5, roll_no 1–5), "
+            "Questions (option_display alpha/numeric), Exams (Simple Draft/Frozen/Completed), Reports and Leaderboard."
         ))

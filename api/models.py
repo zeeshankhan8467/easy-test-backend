@@ -13,7 +13,7 @@ class Exam(models.Model):
     
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True, null=True)
-    duration = models.IntegerField(help_text="Duration in minutes")
+    duration = models.IntegerField(help_text="Duration in seconds allowed per question (for session timer)")
     revisable = models.BooleanField(default=True, help_text="Allow participants to revise answers")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
     # Legacy fields - kept for backward compatibility, but question-wise marks are now in ExamQuestion
