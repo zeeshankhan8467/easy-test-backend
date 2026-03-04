@@ -578,10 +578,17 @@ class QuestionViewSet(viewsets.ModelViewSet):
         
         if qtype not in ['mcq', 'true_false', 'multiple_select']:
             return Response(
-                {'error': 'Type must be mcq, true_false, or multiple_select'}, 
+                {'error': 'Type must be mcq, true_false, or multiple_select'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
+        # Option label format: alpha (A,B,C) or numeric (1,2,3). Support both snake_case and camelCase.
+        option_display = request.data.get('option_display') or request.data.get('optionDisplay') or 'alpha'
+        if isinstance(option_display, str):
+            option_display = option_display.strip().lower()
+        if option_display not in ('alpha', 'numeric'):
+            option_display = 'alpha'
+
         try:
             # Try AI generation: Groq first, then Gemini (free), then OpenAI
             ai_questions = []
@@ -634,6 +641,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         type=qtype,
                         options=q_data['options'],
                         correct_answer=q_data['correct_answer'],
+                        option_display=option_display,
                         difficulty=q_data.get('difficulty', difficulty),
                         tags=q_data.get('tags', [topic]),
                         marks=q_data.get('marks', 1.0)
@@ -1056,6 +1064,26 @@ PARTICIPANT_REPORT_FIELDS = [
 ]
 
 
+def _has_value(v):
+    """Return True if v is considered non-empty for report display."""
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    return True
+
+
+def _participant_detail_columns_with_data(participant_results):
+    """Return list of (label, key) from PARTICIPANT_REPORT_FIELDS where at least one result has a non-empty value. Used so we only show user-detail columns that have data."""
+    if not participant_results:
+        return []
+    out = []
+    for label, key in PARTICIPANT_REPORT_FIELDS:
+        if any(_has_value(r.get(key)) for r in participant_results):
+            out.append((label, key))
+    return out
+
+
 def _participant_report_row(participant):
     """Build a dict of all participant user-data for report export (flat key -> value)."""
     extra = participant.extra or {}
@@ -1124,6 +1152,7 @@ def _get_exam_report_data(exam):
         participant_results.append({
             'participant_id': p.id,
             'participant_name': p.name,
+            'name': p.name or '',
             'clicker_id': user_row['clicker_id'],
             'email': user_row['email'],
             'roll_no': user_row['roll_no'],
@@ -1150,7 +1179,7 @@ def _get_exam_report_data(exam):
         })
     for idx, result in enumerate(participant_results, 1):
         result['rank'] = idx
-    return {
+    report_data = {
         'exam_id': exam.id,
         'exam_title': exam.title,
         'total_participants': total_participants,
@@ -1158,8 +1187,10 @@ def _get_exam_report_data(exam):
         'highest_score': float(highest),
         'lowest_score': float(lowest),
         'question_analysis': question_analysis,
-        'participant_results': participant_results
+        'participant_results': participant_results,
+        'participant_detail_columns': _participant_detail_columns_with_data(participant_results),
     }
+    return report_data
 
 
 @api_view(['GET'])
@@ -1184,8 +1215,10 @@ def _format_question_options(question):
     return '\n'.join([f'{chr(65 + i)}. {opt}' for i, opt in enumerate(opts)])
 
 
-def _write_results_by_participants_detail_sheet(workbook, exam):
-    """Write 'Results by Participants (Detail)' sheet: exam metadata + per-participant blocks with Question, Option, Type Correct Answer, Speed, Score."""
+def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None):
+    """Write 'Results by Participants (Detail)' sheet: exam metadata + per-participant blocks with Question, Option, Type Correct Answer, Speed, Score. Only includes user-detail fields that have data (if participant_detail_columns provided)."""
+    if participant_detail_columns is None:
+        participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
     # Excel sheet names cannot contain [ ] \ / * ? :
     sheet_name = 'Results by Participants (Detail)'
     if sheet_name in workbook.sheetnames:
@@ -1216,8 +1249,8 @@ def _write_results_by_participants_detail_sheet(workbook, exam):
         participant = attempt.participant
         keypad = getattr(participant, 'clicker_id', None) or participant.name or str(participant.id)
         user_row = _participant_report_row(participant)
-        # Participant details block (all user data)
-        for label, key in PARTICIPANT_REPORT_FIELDS:
+        # Participant details block (only fields that have data in report)
+        for label, key in participant_detail_columns:
             val = user_row.get(key, '') or ''
             ws.cell(row=row_num, column=1, value=label)
             ws.cell(row=row_num, column=2, value=str(val))
@@ -1282,8 +1315,10 @@ def _sanitize_sheet_name(name):
     return (name or 'Sheet')[:31]
 
 
-def _write_results_by_participants_individual(workbook, exam):
-    """One sheet per participant (sheet name = keypad id). Same layout as reference: title, date, questions count, metadata, Keypad summary, then Question|Option|Response|Slide Type|Correct Answer|Speed|Score."""
+def _write_results_by_participants_individual(workbook, exam, participant_detail_columns=None):
+    """One sheet per participant (sheet name = keypad id). Same layout as reference: title, date, questions count, metadata, Keypad summary, then Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data (if participant_detail_columns provided)."""
+    if participant_detail_columns is None:
+        participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
     red_header_fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
     white_font = Font(color='FFFFFF', bold=True)
     bold_font = Font(bold=True)
@@ -1314,8 +1349,8 @@ def _write_results_by_participants_individual(workbook, exam):
         row += 1
         ws.cell(row=row, column=1, value=f'Questions Count: {n_questions}')
         row += 2
-        # Participant details (all user data)
-        for label, key in PARTICIPANT_REPORT_FIELDS:
+        # Participant details (only fields that have data in report)
+        for label, key in participant_detail_columns:
             val = user_row.get(key, '') or ''
             ws.cell(row=row, column=1, value=label)
             ws.cell(row=row, column=2, value=str(val))
@@ -1480,6 +1515,9 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
         del workbook[sheet_name]
     ws = workbook.create_sheet(sheet_name, 0)
 
+    green_fill = PatternFill(start_color='90EE90', end_color='90EE90', fill_type='solid')  # light green for correct
+    red_fill = PatternFill(start_color='FFB6C1', end_color='FFB6C1', fill_type='solid')    # light red for wrong
+
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
     assigned = list(ExamParticipant.objects.filter(exam=exam).select_related('participant').order_by('participant__clicker_id'))
     # Natural order by keypad id (1, 2, ... 9, 10, 11)
@@ -1519,8 +1557,11 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
         ws.cell(row=row, column=1, value=label)
         ws.cell(row=row, column=2, value=col_b)
         row += 1
-    # Table header row
-    headers = list(PERSONAL_ACHIEVEMENT_HEADERS)
+    # Table header row: Keypad No., Name, then only detail columns that have data (excl. name/clicker_id), then Score, Correct Rate, Ranking, then question columns
+    user_rows = [_participant_report_row(ep.participant) for ep in assigned]
+    detail_columns = _participant_detail_columns_with_data(user_rows)
+    detail_columns_no_id = [(label, key) for (label, key) in detail_columns if key not in ('name', 'clicker_id')]
+    headers = ['Keypad No.', 'Name'] + [label for (label, _) in detail_columns_no_id] + ['Score', 'Correct Rate', 'Ranking']
     for order_idx, eq in enumerate(exam_questions, start=1):
         headers.append(f'{order_idx}-S{order_idx}')
     for col, h in enumerate(headers, 1):
@@ -1545,7 +1586,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
         col += 1
         ws.cell(row=row, column=col, value=p.name or '')
         col += 1
-        for key in ['roll_no', 'admission_no', 'class', 'subject', 'section', 'team', 'group', 'house', 'gender', 'city', 'uid', 'employee_code', 'teacher_name', 'email_id']:
+        for _label, key in detail_columns_no_id:
             ws.cell(row=row, column=col, value=user_row.get(key, '') or '')
             col += 1
         ws.cell(row=row, column=col, value=score_val)
@@ -1559,14 +1600,18 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
                 ans = answer_map.get((attempt.id, eq.question_id))
                 if ans and ans.is_correct:
                     q_score = float(eq.positive_marks)
+                    cell = ws.cell(row=row, column=col, value=q_score)
+                    cell.fill = green_fill
                 elif ans:
                     q_score = -float(eq.negative_marks)
+                    cell = ws.cell(row=row, column=col, value=q_score)
+                    cell.fill = red_fill
                 else:
-                    q_score = None
+                    cell = ws.cell(row=row, column=col, value='')
+                col += 1
             else:
-                q_score = None
-            ws.cell(row=row, column=col, value=q_score if q_score is not None else '')
-            col += 1
+                ws.cell(row=row, column=col, value='')
+                col += 1
         row += 1
 
     for c in range(1, len(headers) + 1):
@@ -1591,9 +1636,15 @@ def _build_export_http_response(request, exam):
     format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
     layout = (request.query_params.get('layout') or '').strip().lower()
     report_data = _get_exam_report_data(exam)
+    detail_columns = report_data.get('participant_detail_columns') or []
+    detail_keys = [k for (_, k) in detail_columns]
+    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'rank']
+    export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
+    df = df[[c for c in export_columns if c in df.columns]]
     output = BytesIO()
     if format_type == 'excel':
+        content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             if layout == 'personal_achievement':
                 _write_personal_achievement_and_detail_sheet(writer.book, exam)
@@ -1602,12 +1653,12 @@ def _build_export_http_response(request, exam):
                 df.to_excel(writer, sheet_name='Participant Results', index=False)
                 qa_df = pd.DataFrame(report_data['question_analysis'])
                 qa_df.to_excel(writer, sheet_name='Question Analysis', index=False)
-                _write_results_by_participants_detail_sheet(writer.book, exam)
+                _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
                 filename = f'report-{exam.id}.xlsx'
     else:
-        df.to_csv(output, index=False)
         content_type = 'text/csv'
         filename = f'report-{exam.id}.csv'
+        df.to_csv(output, index=False)
     output.seek(0)
     return Response(
         output.getvalue(),
@@ -1637,13 +1688,18 @@ export_report.renderer_classes = [BinaryFileRenderer]
 def _build_export_file_response(format_type, exam, layout=None):
     """Build Excel or CSV as Django HttpResponse. layout='individual' => one sheet per participant; layout='questions' => Results by Questions; layout='personal_achievement' => Personal Achievement and Detail."""
     report_data = _get_exam_report_data(exam)
+    detail_columns = report_data.get('participant_detail_columns') or []
+    detail_keys = [k for (_, k) in detail_columns]
+    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'rank']
+    export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
+    df = df[[c for c in export_columns if c in df.columns]]
     output = BytesIO()
     if format_type == 'excel':
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             layout_l = (layout or '').strip().lower()
             if layout_l == 'individual':
-                _write_results_by_participants_individual(writer.book, exam)
+                _write_results_by_participants_individual(writer.book, exam, participant_detail_columns=detail_columns)
                 filename = f'report-{exam.id}-individual.xlsx'
             elif layout_l == 'questions':
                 _write_results_by_questions_sheet(writer.book, exam)
@@ -1660,7 +1716,7 @@ def _build_export_file_response(format_type, exam, layout=None):
                 df.to_excel(writer, sheet_name='Participant Results', index=False)
                 qa_df = pd.DataFrame(report_data['question_analysis'])
                 qa_df.to_excel(writer, sheet_name='Question Analysis', index=False)
-                _write_results_by_participants_detail_sheet(writer.book, exam)
+                _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
                 filename = f'report-{exam.id}.xlsx'
         content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     else:
