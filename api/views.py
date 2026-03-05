@@ -120,6 +120,12 @@ class ExamViewSet(viewsets.ModelViewSet):
         import hashlib
         import json as json_lib
         
+        option_display = (request.data.get('option_display') or request.data.get('optionDisplay') or 'alpha')
+        if isinstance(option_display, str):
+            option_display = option_display.strip().lower()
+        if option_display not in ('alpha', 'numeric'):
+            option_display = 'alpha'
+        
         questions = exam.exam_questions.select_related('question').order_by('order')
         snapshot_data = {
             'exam_id': exam.id,
@@ -127,11 +133,15 @@ class ExamViewSet(viewsets.ModelViewSet):
             'description': exam.description,
             'duration': exam.duration,
             'revisable': exam.revisable,
+            'option_display': option_display,
             'frozen_at': timezone.now().isoformat(),
             'questions': []
         }
         
         for eq in questions:
+            q_display = getattr(eq.question, 'option_display', None) or option_display
+            if str(q_display).lower() not in ('alpha', 'numeric'):
+                q_display = option_display
             snapshot_data['questions'].append({
                 'question_id': eq.question.id,
                 'order': eq.order,
@@ -140,6 +150,7 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'options': eq.question.options,
                 'correct_answer': eq.question.correct_answer,
                 'difficulty': eq.question.difficulty,
+                'option_display': q_display,
                 'positive_marks': float(eq.positive_marks),
                 'negative_marks': float(eq.negative_marks),
                 'is_optional': eq.is_optional,
@@ -208,6 +219,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Return stored snapshot if frozen, otherwise generate current snapshot
         if exam.snapshot_data:
             snapshot_data = exam.snapshot_data
+            snapshot_data.setdefault('option_display', 'alpha')
         else:
             questions = exam.exam_questions.select_related('question').order_by('order')
             snapshot_data = {
@@ -216,11 +228,15 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'description': exam.description,
                 'duration': exam.duration,
                 'revisable': exam.revisable,
+                'option_display': 'alpha',
                 'generated_at': timezone.now().isoformat(),
                 'questions': []
             }
             
             for eq in questions:
+                q_display = getattr(eq.question, 'option_display', 'alpha')
+                if str(q_display).lower() not in ('alpha', 'numeric'):
+                    q_display = 'alpha'
                 snapshot_data['questions'].append({
                     'question_id': eq.question.id,
                     'order': eq.order,
@@ -229,6 +245,7 @@ class ExamViewSet(viewsets.ModelViewSet):
                     'options': eq.question.options,
                     'correct_answer': eq.question.correct_answer,
                     'difficulty': eq.question.difficulty,
+                    'option_display': q_display,
                     'positive_marks': float(eq.positive_marks),
                     'negative_marks': float(eq.negative_marks),
                     'is_optional': eq.is_optional,
