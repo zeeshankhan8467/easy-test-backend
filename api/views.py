@@ -376,6 +376,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         skipped_no_participant = 0
         skipped_no_question = 0
         skipped_already_answered = 0
+        answers_updated = 0  # when revisable=True, overwrite existing answer
         for item in responses_data:
             participant = get_or_create_participant_for_clicker(
                 participant_id=item.get('participant_id'),
@@ -407,11 +408,6 @@ class ExamViewSet(viewsets.ModelViewSet):
             )
             created_attempts[participant.id] = attempt
 
-            # One response per participant per question - do not overwrite
-            if Answer.objects.filter(attempt=attempt, question_id=question_id).exists():
-                skipped_already_answered += 1
-                continue
-
             correct = is_correct(qinfo, selected)
             pos = float(qinfo.get('positive_marks', 1))
             neg = float(qinfo.get('negative_marks', 0))
@@ -428,6 +424,18 @@ class ExamViewSet(viewsets.ModelViewSet):
                 except Exception:
                     pass
 
+            existing = Answer.objects.filter(attempt=attempt, question_id=question_id).first()
+            if existing:
+                if exam.revisable:
+                    existing.selected_answer = selected if isinstance(selected, list) else [selected]
+                    existing.is_correct = correct
+                    existing.time_taken = time_taken
+                    existing.save()
+                    answers_updated += 1
+                else:
+                    skipped_already_answered += 1
+                continue
+
             Answer.objects.create(
                 attempt=attempt,
                 question_id=question_id,
@@ -438,9 +446,9 @@ class ExamViewSet(viewsets.ModelViewSet):
             answers_created += 1
 
         logger.info(
-            '[sync_live_results] Exam id=%s: answers_created=%d, attempts_updated=%d, '
+            '[sync_live_results] Exam id=%s: answers_created=%d, answers_updated=%d, attempts_updated=%d, '
             'skipped_no_participant=%d, skipped_no_question=%d, skipped_already_answered=%d',
-            pk, answers_created, len(created_attempts),
+            pk, answers_created, answers_updated, len(created_attempts),
             skipped_no_participant, skipped_no_question, skipped_already_answered
         )
 
@@ -483,6 +491,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         )
         return Response({
             'synced': answers_created,
+            'answers_updated': answers_updated,
             'attempts_updated': len(created_attempts),
             'received': len(responses_data),
             'skipped_no_participant': skipped_no_participant,
