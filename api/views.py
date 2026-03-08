@@ -283,6 +283,17 @@ class ExamViewSet(viewsets.ModelViewSet):
 
         responses_data = request.data.get('responses', [])
         attendance_ids = request.data.get('attendance', [])
+        exam_started_at_raw = request.data.get('exam_started_at')
+        exam_started_at_parsed = None
+        if exam_started_at_raw:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(str(exam_started_at_raw).replace('Z', '+00:00'))
+                if timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt)
+                exam_started_at_parsed = dt
+            except (ValueError, TypeError):
+                pass
         logger.info(
             '[sync_live_results] Exam id=%s: received %d responses, %d attendance',
             pk, len(responses_data), len(attendance_ids)
@@ -401,10 +412,13 @@ class ExamViewSet(viewsets.ModelViewSet):
             if selected is None:
                 continue
 
+            attempt_defaults = {'total_questions': len(snapshot_questions)}
+            if exam_started_at_parsed is not None:
+                attempt_defaults['started_at'] = exam_started_at_parsed
             attempt, _ = ExamAttempt.objects.get_or_create(
                 exam=exam,
                 participant=participant,
-                defaults={'total_questions': len(snapshot_questions)}
+                defaults=attempt_defaults
             )
             created_attempts[participant.id] = attempt
 
