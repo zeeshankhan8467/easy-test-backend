@@ -1,9 +1,10 @@
 """
 Seed dummy data for all EasyTest features: users, participants, questions, exams,
 exam-question/participant links, attempts, and answers.
-Uses simple, predictable data so you can verify all values (e.g. Student 1 → roll 1, clicker_id 1).
+Only multiple choice (mcq) questions are created.
 Run: python manage.py seed_dummy_data
-Use --clear to remove existing dummy data first (optional).
+Use --clear to remove existing dummy exams first (optional).
+Use --skip-existing to skip if dummy data already exists.
 """
 import hashlib
 import json as json_lib
@@ -29,24 +30,17 @@ PARTICIPANTS_DATA = [
 ]
 EXTRA_KEYS = ["roll_no", "admission_no", "class", "subject", "section", "team", "group", "house", "gender", "city", "uid", "employee_code", "teacher_name", "email_id"]
 
-# ─── Question bank: simple data for easy verification ─────────────────────
+# ─── Question bank: multiple choice only (mcq) ─────────────────────────────
 # Each tuple: (text, type, options, correct_answer, difficulty, option_display)
-# correct_answer: single index for mcq/true_false, list of indices for multiple_select
+# correct_answer: single 0-based index for mcq
 QUESTIONS_BANK = [
-    # MCQ with alpha labels (A, B, C, D) — correct is index 0 = first option
     ("What is 1 + 1?", "mcq", ["1", "2", "3", "4"], 1, "easy", "alpha"),
     ("What is 2 + 2?", "mcq", ["2", "3", "4", "5"], 2, "easy", "alpha"),
     ("Capital of India?", "mcq", ["Mumbai", "Delhi", "Kolkata", "Chennai"], 1, "easy", "alpha"),
-    # MCQ with numeric labels (1, 2, 3, 4)
     ("How many days in a week?", "mcq", ["5", "6", "7", "8"], 2, "easy", "numeric"),
     ("Which is the largest number?", "mcq", ["10", "20", "30", "40"], 3, "easy", "numeric"),
-    # True/False
-    ("The sky is blue.", "true_false", ["True", "False"], 0, "easy", "alpha"),
-    ("2 + 2 = 5.", "true_false", ["True", "False"], 1, "easy", "alpha"),
-    ("Django is a Python framework.", "true_false", ["True", "False"], 0, "medium", "alpha"),
-    # Multiple select
-    ("Which are even numbers? (select two)", "multiple_select", ["2", "3", "4", "5"], [0, 2], "easy", "alpha"),
-    ("Which are vowels? (select two)", "multiple_select", ["A", "B", "E", "F"], [0, 2], "easy", "numeric"),
+    ("Which planet is known as the Red Planet?", "mcq", ["Venus", "Mars", "Jupiter", "Saturn"], 1, "easy", "alpha"),
+    ("What is 5 × 3?", "mcq", ["10", "15", "20", "25"], 1, "easy", "alpha"),
 ]
 
 # ─── Exam definitions: (title, description, duration_sec_per_question, revisable, status) ───

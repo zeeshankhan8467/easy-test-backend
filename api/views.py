@@ -1245,13 +1245,30 @@ def _get_exam_report_data(exam):
         correct_attempts = answers.filter(is_correct=True).count()
         accuracy = (correct_attempts / total_attempts * 100) if total_attempts > 0 else 0
         avg_time = answers.aggregate(avg=Avg('time_taken'))['avg'] or 0
+        # Per-option vote counts (0-based index -> count)
+        options = question.options or []
+        option_votes = [0] * len(options)
+        for a in answers:
+            sel = a.selected_answer
+            if sel is None:
+                continue
+            if isinstance(sel, list):
+                for idx in sel:
+                    if isinstance(idx, int) and 0 <= idx < len(option_votes):
+                        option_votes[idx] += 1
+            elif isinstance(sel, int) and 0 <= sel < len(option_votes):
+                option_votes[sel] += 1
         question_analysis.append({
             'question_id': question.id,
             'question_text': question.text,
             'total_attempts': total_attempts,
             'correct_attempts': correct_attempts,
             'accuracy': accuracy,
-            'average_time': avg_time
+            'average_time': avg_time,
+            'options': options,
+            'option_display': getattr(question, 'option_display', 'alpha'),
+            'correct_answer': _normalize_correct_answer(question.correct_answer),
+            'option_votes': option_votes,
         })
     participant_results = []
     for attempt in attempts.order_by('-score', 'time_taken'):
@@ -1311,6 +1328,15 @@ def exam_report(request, exam_id):
     report_data = _get_exam_report_data(exam)
     serializer = ExamReportSerializer(report_data)
     return Response(serializer.data)
+
+
+def _normalize_correct_answer(correct_answer):
+    """Return correct_answer as a list of 0-based indices (for API consistency)."""
+    if correct_answer is None:
+        return []
+    if isinstance(correct_answer, list):
+        return [int(x) for x in correct_answer if x is not None]
+    return [int(correct_answer)]
 
 
 def _format_question_options(question):
@@ -1585,6 +1611,7 @@ def _write_results_by_questions_sheet(workbook, exam):
     ws = workbook.create_sheet(sheet_name, 0)
     red_header_fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
     white_font = Font(color='FFFFFF', bold=True)
+    green_fill = PatternFill(start_color='90EE90', end_color='90EE90', fill_type='solid')
 
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
     answers_by_question = {}  # question_id -> list of selected_answer (int or list)
@@ -1648,18 +1675,23 @@ def _write_results_by_questions_sheet(workbook, exam):
             ws.cell(row=row, column=c).font = white_font
         row += 1
 
+        correct_indices = set(_normalize_correct_answer(q.correct_answer))
         for i, opt in enumerate(options):
             letter = chr(ord('A') + i) if i < 26 else 'X'
             opt_label = f'{i+1}/{letter}. {opt}'
             vote_count = option_votes[i] if i < len(option_votes) else 0
-            pct = round(vote_count / total_answers, 4) if total_answers else 0
+            pct = (vote_count / total_answers * 100) if total_answers else 0
+            is_correct = i in correct_indices
             ws.cell(row=row, column=1, value=opt_label)
             ws.cell(row=row, column=2, value=vote_count)
-            ws.cell(row=row, column=3, value=pct)
+            ws.cell(row=row, column=3, value=f'{pct:.2f}%')
+            if is_correct:
+                for c in range(1, 4):
+                    ws.cell(row=row, column=c).fill = green_fill
             row += 1
         ws.cell(row=row, column=1, value='Voted')
         ws.cell(row=row, column=2, value=total_answers)
-        ws.cell(row=row, column=3, value=1)
+        ws.cell(row=row, column=3, value='100.00%')
         row += 2
 
     ws.column_dimensions['A'].width = 50
