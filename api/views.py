@@ -295,6 +295,10 @@ class ExamViewSet(viewsets.ModelViewSet):
             except (ValueError, TypeError):
                 pass
         logger.info(
+            '[sync_live_results] TIME_TAKEN DEBUG: exam_started_at raw=%s parsed=%s',
+            exam_started_at_raw, exam_started_at_parsed
+        )
+        logger.info(
             '[sync_live_results] Exam id=%s: received %d responses, %d attendance',
             pk, len(responses_data), len(attendance_ids)
         )
@@ -415,11 +419,19 @@ class ExamViewSet(viewsets.ModelViewSet):
             attempt_defaults = {'total_questions': len(snapshot_questions)}
             if exam_started_at_parsed is not None:
                 attempt_defaults['started_at'] = exam_started_at_parsed
-            attempt, _ = ExamAttempt.objects.get_or_create(
+            attempt, attempt_created = ExamAttempt.objects.get_or_create(
                 exam=exam,
                 participant=participant,
                 defaults=attempt_defaults
             )
+            # Django ignores defaults for auto_now_add=True, so set started_at after create when client sent exam_started_at
+            if attempt_created and exam_started_at_parsed is not None:
+                attempt.started_at = exam_started_at_parsed
+                attempt.save(update_fields=['started_at'])
+                logger.info(
+                    '[sync_live_results] TIME_TAKEN DEBUG: new attempt started_at set from client: %s',
+                    exam_started_at_parsed
+                )
             created_attempts[participant.id] = attempt
 
             correct = is_correct(qinfo, selected)
@@ -434,9 +446,31 @@ class ExamViewSet(viewsets.ModelViewSet):
                         answered = datetime.fromisoformat(raw.replace('Z', '+00:00'))
                         if timezone.is_naive(answered):
                             answered = timezone.make_aware(answered)
-                        time_taken = max(0, int((answered - attempt.started_at).total_seconds()))
-                except Exception:
-                    pass
+                    else:
+                        answered = raw
+                    # Per-question time: delta from previous answer (or exam start for first answer)
+                    prev = (
+                        Answer.objects.filter(attempt=attempt, answered_at__lt=answered)
+                        .order_by('-answered_at')
+                        .values_list('answered_at', flat=True)
+                        .first()
+                    )
+                    base = prev if prev else attempt.started_at
+                    time_taken = max(0, int((answered - base).total_seconds()))
+                    logger.info(
+                        '[sync_live_results] TIME_TAKEN DEBUG: question_id=%s participant_id=%s '
+                        'base=%s answered_at=%s -> time_taken(sec)=%s',
+                        question_id, participant.id, base, raw, time_taken
+                    )
+                except Exception as e:
+                    logger.warning('[sync_live_results] TIME_TAKEN DEBUG: failed to compute time_taken: %s', e)
+            else:
+                if item.get('answered_at') or attempt.started_at:
+                    logger.info(
+                        '[sync_live_results] TIME_TAKEN DEBUG: question_id=%s time_taken=0 (no answered_at or no attempt.started_at) '
+                        'answered_at=%s attempt.started_at=%s',
+                        question_id, item.get('answered_at'), getattr(attempt, 'started_at', None)
+                    )
 
             existing = Answer.objects.filter(attempt=attempt, question_id=question_id).first()
             if existing:
