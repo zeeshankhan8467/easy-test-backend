@@ -22,6 +22,8 @@ from datetime import timedelta
 import pandas as pd
 import json
 import logging
+import re
+import html as html_module
 from io import BytesIO
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -1060,6 +1062,26 @@ class ParticipantViewSet(viewsets.ModelViewSet):
 
 
 # Reports Views
+# IST timezone for report date/time (dd/mm/yyyy format)
+def _report_now_ist():
+    """Return current datetime in IST (Asia/Kolkata) for report display."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    ist = ZoneInfo('Asia/Kolkata')
+    return timezone.now().astimezone(ist)
+
+
+def _report_datetime_ist():
+    """Return current datetime string in IST, format dd/mm/yyyy HH:MM (e.g. 08/03/2026 14:30)."""
+    return _report_now_ist().strftime('%d/%m/%Y %H:%M')
+
+
+def _report_datetime_ist_12h():
+    """Return current datetime string in IST with 12-hour AM/PM (e.g. 08/03/2026 02:30 PM)."""
+    return _report_now_ist().strftime('%d/%m/%Y %I:%M:%S %p')
+
 # Participant fields to include in report export (label for display, key in Participant.extra or model)
 PARTICIPANT_REPORT_FIELDS = [
     ('Name', 'name'),
@@ -1099,6 +1121,18 @@ def _participant_detail_columns_with_data(participant_results):
         if any(_has_value(r.get(key)) for r in participant_results):
             out.append((label, key))
     return out
+
+
+def _format_participant_detail_line(user_row, participant_detail_columns):
+    """Build client-style single line for participant block: 'Name: x\\nkey: value' for only fields that have data."""
+    parts = [f'Name: {user_row.get("name", "") or ""}']
+    for _label, key in participant_detail_columns:
+        if key in ('name', 'clicker_id'):
+            continue
+        val = user_row.get(key, '') or ''
+        if _has_value(val):
+            parts.append(f'{key}: {val}')
+    return '\n'.join(parts)
 
 
 def _participant_report_row(participant):
@@ -1232,97 +1266,139 @@ def _format_question_options(question):
     return '\n'.join([f'{chr(65 + i)}. {opt}' for i, opt in enumerate(opts)])
 
 
+def _strip_html(text):
+    """Remove HTML tags and unescape entities from text for plain-text report display."""
+    if not text or not isinstance(text, str):
+        return text or ''
+    text = re.sub(r'<[^>]+>', '', text)
+    return html_module.unescape(text).strip()
+
+
+def _option_label_for_index(index, option_display):
+    """Return single option label (A/B/C or 1/2/3) for 0-based index."""
+    if option_display == 'numeric':
+        return str(index + 1)
+    return chr(65 + index) if 0 <= index < 26 else str(index + 1)
+
+
+def _format_attempted_option_label(question, selected_answer):
+    """Return the attempted option label(s) for display as numeric (1, 2, 3...). For MCQ/true_false show single number; for multiple_select show comma-separated."""
+    if selected_answer is None:
+        return ''
+    # Single-choice (MCQ, true_false): show one number only (if stored as list, take first)
+    qtype = getattr(question, 'type', 'mcq')
+    if qtype in ('mcq', 'true_false'):
+        if isinstance(selected_answer, list):
+            selected_answer = selected_answer[0] if selected_answer else None
+        if selected_answer is None:
+            return ''
+        return str(selected_answer + 1)
+    # Multiple-select: show comma-separated numbers
+    if isinstance(selected_answer, list):
+        return ', '.join(str(i + 1) for i in selected_answer)
+    return str(selected_answer + 1)
+
+
 def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None):
-    """Write 'Results by Participants (Detail)' sheet: exam metadata + per-participant blocks with Question, Option, Type Correct Answer, Speed, Score. Only includes user-detail fields that have data (if participant_detail_columns provided)."""
+    """Write 'Results by Participants(Detail)' sheet to match client format: metadata, then per-participant blocks with Keypad/Name line and table Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data."""
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
-    # Excel sheet names cannot contain [ ] \ / * ? :
-    sheet_name = 'Results by Participants (Detail)'
+    sheet_name = 'Results by Participants(Detail)'
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
     ws = workbook.create_sheet(sheet_name, 0)
     red_header_fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
     white_font = Font(color='FFFFFF', bold=True)
-    bold_font = Font(bold=True)
 
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
     attempts = list(ExamAttempt.objects.filter(exam=exam).order_by('-score', 'time_taken').select_related('participant'))
-    answer_map = {}  # (attempt_id, question_id) -> Answer
+    answer_map = {}
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
     row_num = 1
-    # Title
-    ws.cell(row=row_num, column=1, value='Results by Participants [Detail]')  # display title (brackets OK in cell)
+    ws.cell(row=row_num, column=1, value='Results by Participants(Detail)')
     ws.cell(row=row_num, column=1).font = Font(bold=True, size=14)
     row_num += 1
-    # Date and Questions Count
-    ws.cell(row=row_num, column=1, value=f'Date: {timezone.now().strftime("%m/%d/%Y %H:%M")}')
+    ws.cell(row=row_num, column=1, value=_report_datetime_ist())
     row_num += 1
     ws.cell(row=row_num, column=1, value=f'Questions Count: {len(exam_questions)}')
     row_num += 2
+    # Metadata block (client format: label in A, value in B; Theme/Faculty/Batch empty)
+    for label, col_b in [
+        ('Sl No.', ''),
+        ('Exam Unique Id', str(exam.id)),
+        ('Exam Name', exam.title or ''),
+        ('Theme', ''),
+        ('Faculty', ''),
+        ('Subject', exam.title or ''),
+        ('Batch', ''),
+    ]:
+        ws.cell(row=row_num, column=1, value=label)
+        ws.cell(row=row_num, column=2, value=col_b)
+        row_num += 1
+    row_num += 1
 
     for attempt in attempts:
         participant = attempt.participant
         keypad = getattr(participant, 'clicker_id', None) or participant.name or str(participant.id)
         user_row = _participant_report_row(participant)
-        # Participant details block (only fields that have data in report)
-        for label, key in participant_detail_columns:
-            val = user_row.get(key, '') or ''
-            ws.cell(row=row_num, column=1, value=label)
-            ws.cell(row=row_num, column=2, value=str(val))
-            row_num += 1
-        row_num += 1
-        # Keypad No.
+        # Client format: row 1 = Keypad No. X, Correct Count, Score; row 2 = Name + details (only fields with data), Correct Rate %, Ranking
         ws.cell(row=row_num, column=1, value=f'Keypad No. {keypad}')
-        ws.cell(row=row_num, column=1).font = bold_font
+        ws.cell(row=row_num, column=2, value=f'Correct Count: {attempt.correct_answers}')
+        ws.cell(row=row_num, column=3, value=f'Score: {int(attempt.score)}')
         row_num += 1
-        # Correct Co Score / Correct Rs Ranking
-        ws.cell(row=row_num, column=1, value=f'Correct Co Score: {float(attempt.score)}')
-        ws.cell(row=row_num, column=2, value=f'Correct Rs Ranking: {attempt.correct_answers}/{attempt.total_questions}')
+        detail_line = _format_participant_detail_line(user_row, participant_detail_columns)
+        correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
+        ws.cell(row=row_num, column=1, value=detail_line)
+        ws.cell(row=row_num, column=2, value=f'Correct Rate: {correct_rate:.2f}%')
+        ws.cell(row=row_num, column=3, value=f'Ranking: {attempt.correct_answers}/{attempt.total_questions}')
         row_num += 1
-        # Table header
-        headers = ['Question', 'Option', 'Response Date', 'Type Correct Answer', 'Speed', 'Score']
+        # Table header: Question, Option, Response, Slide Type, Correct Answer, Speed, Score
+        headers = ['Question', 'Option', 'Response', 'Slide Type', 'Correct Answer', 'Speed', 'Score']
         for col, h in enumerate(headers, 1):
             c = ws.cell(row=row_num, column=col, value=h)
             c.fill = red_header_fill
             c.font = white_font
         row_num += 1
-        # One row per exam question
-        for eq in exam_questions:
+        for order_idx, eq in enumerate(exam_questions, start=1):
             q = eq.question
             options_text = _format_question_options(q)
             answer = answer_map.get((attempt.id, q.id))
+            correct_idx = q.correct_answer
+            if isinstance(correct_idx, list):
+                correct_display = correct_idx[0] + 1 if correct_idx else ''
+            else:
+                correct_display = int(correct_idx) + 1 if correct_idx is not None else ''
             if answer:
                 sel = answer.selected_answer
                 if isinstance(sel, list):
-                    type_correct = ', '.join(str(s + 1) for s in sel) + ' Choice'
+                    response_val = (sel[0] + 1) if sel else ''
                 else:
-                    type_correct = f'{int(sel) + 1} Choice' if sel is not None else ''
-                response_date = answer.answered_at.strftime('%m/%d/%Y %H:%M') if answer.answered_at else ''
-                speed = answer.time_taken  # seconds; can show as decimal e.g. round(answer.time_taken, 2)
-                score = float(eq.positive_marks) if answer.is_correct else -float(eq.negative_marks)
+                    response_val = int(sel) + 1 if sel is not None else ''
+                speed = round(answer.time_taken, 2) if answer.time_taken is not None else ''
+                score = int(eq.positive_marks) if answer.is_correct else -int(eq.negative_marks)
             else:
-                type_correct = ''
-                response_date = ''
+                response_val = ''
                 speed = ''
                 score = 0
-            ws.cell(row=row_num, column=1, value=q.text)
+            ws.cell(row=row_num, column=1, value=f'{order_idx}. {_strip_html(q.text)}')
             ws.cell(row=row_num, column=2, value=options_text)
-            ws.cell(row=row_num, column=3, value=response_date)
-            ws.cell(row=row_num, column=4, value=type_correct)
-            ws.cell(row=row_num, column=5, value=speed)
-            ws.cell(row=row_num, column=6, value=score)
+            ws.cell(row=row_num, column=3, value=response_val)
+            ws.cell(row=row_num, column=4, value='Choice')
+            ws.cell(row=row_num, column=5, value=correct_display)
+            ws.cell(row=row_num, column=6, value=speed)
+            ws.cell(row=row_num, column=7, value=score)
             row_num += 1
-        row_num += 1  # blank row between participants
+        row_num += 1
 
-    # Column widths
     ws.column_dimensions['A'].width = 45
     ws.column_dimensions['B'].width = 35
-    ws.column_dimensions['C'].width = 18
-    ws.column_dimensions['D'].width = 22
-    ws.column_dimensions['E'].width = 10
-    ws.column_dimensions['F'].width = 8
+    ws.column_dimensions['C'].width = 10
+    ws.column_dimensions['D'].width = 12
+    ws.column_dimensions['E'].width = 14
+    ws.column_dimensions['F'].width = 10
+    ws.column_dimensions['G'].width = 8
 
 
 def _sanitize_sheet_name(name):
@@ -1347,7 +1423,7 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
         answer_map[(a.attempt_id, a.question_id)] = a
 
     n_questions = len(exam_questions)
-    report_date = timezone.now().strftime('%m/%d/%Y %H:%M')
+    report_date = _report_datetime_ist()
 
     for attempt in attempts:
         participant = attempt.participant
@@ -1366,19 +1442,28 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
         row += 1
         ws.cell(row=row, column=1, value=f'Questions Count: {n_questions}')
         row += 2
-        # Participant details (only fields that have data in report)
-        for label, key in participant_detail_columns:
-            val = user_row.get(key, '') or ''
+        # Metadata block (client format)
+        for label, col_b in [
+            ('Sl No.', ''),
+            ('Exam Unique Id', str(exam.id)),
+            ('Exam Name', exam.title or ''),
+            ('Theme', ''),
+            ('Faculty', ''),
+            ('Subject', exam.title or ''),
+            ('Batch', ''),
+        ]:
             ws.cell(row=row, column=1, value=label)
-            ws.cell(row=row, column=2, value=str(val))
+            ws.cell(row=row, column=2, value=col_b)
             row += 1
         row += 1
-        # Keypad summary
-        correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
+        # Keypad summary row + Name/details row (only fields with data)
         ws.cell(row=row, column=1, value=f'Keypad No. {keypad}')
         ws.cell(row=row, column=2, value=f'Correct Count: {attempt.correct_answers}')
         ws.cell(row=row, column=3, value=f'Score: {int(attempt.score)}')
         row += 1
+        detail_line = _format_participant_detail_line(user_row, participant_detail_columns)
+        correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
+        ws.cell(row=row, column=1, value=detail_line)
         ws.cell(row=row, column=2, value=f'Correct Rate: {correct_rate:.2f}%')
         ws.cell(row=row, column=3, value=f'Ranking: {attempt.correct_answers}/{attempt.total_questions}')
         row += 1
@@ -1411,7 +1496,7 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
                 response_val = ''
                 speed = ''
                 score = 0
-            ws.cell(row=row, column=1, value=f'{order_idx}. {q.text}')
+            ws.cell(row=row, column=1, value=f'{order_idx}. {_strip_html(q.text)}')
             ws.cell(row=row, column=2, value=options_text)
             ws.cell(row=row, column=3, value=response_val)
             ws.cell(row=row, column=4, value='Choice')
@@ -1457,11 +1542,19 @@ def _write_results_by_questions_sheet(workbook, exam):
     row += 1
     ws.cell(row=row, column=1, value=exam.title or '')
     row += 1
-    ws.cell(row=row, column=1, value=timezone.now().strftime('%m/%d/%Y %I:%M:%S %p'))
+    ws.cell(row=row, column=1, value=_report_datetime_ist_12h())
     row += 2
-    for label in ['Sl No.', 'Exam Unique Id', 'Exam Name', 'Theme', 'Faculty', 'Subject', 'Batch']:
+    for label, col_b in [
+        ('Sl No.', ''),
+        ('Exam Unique Id', str(exam.id)),
+        ('Exam Name', exam.title or ''),
+        ('Theme', ''),
+        ('Faculty', ''),
+        ('Subject', exam.title or ''),
+        ('Batch', ''),
+    ]:
         ws.cell(row=row, column=1, value=label)
-        ws.cell(row=row, column=2, value='d')
+        ws.cell(row=row, column=2, value=col_b)
         row += 1
     row += 1
 
@@ -1486,7 +1579,7 @@ def _write_results_by_questions_sheet(workbook, exam):
             correct_count = sum(1 for s in selections if _answer_is_correct(s, q.correct_answer))
             correct_rate = round(correct_count / total_answers * 100, 2)
 
-        ws.cell(row=row, column=1, value=f'{order_idx}. {q.text}')
+        ws.cell(row=row, column=1, value=f'{order_idx}. {_strip_html(q.text)}')
         ws.cell(row=row, column=2, value='Slide Type: Choice')
         ws.cell(row=row, column=3, value=f'Correct Rate: {correct_rate:.2f}%')
         row += 1
@@ -1552,6 +1645,15 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
     rank_by_attempt = {a.id: idx + 1 for idx, a in enumerate(attempted_list)}
     voted_count = len(attempted_list)
 
+    # Order assigned by ranking (rank 1 first, then 2, 3...; absent at end)
+    def _rank_sort_key(ep):
+        if ep.participant_id not in attempts_by_participant:
+            return (1, 999999)  # absent last
+        att = attempts_by_participant[ep.participant_id]
+        return (0, rank_by_attempt.get(att.id, 999999))
+
+    assigned_sorted = sorted(assigned, key=_rank_sort_key)
+
     row = 1
     ws.cell(row=row, column=1, value='Personal Achievement and Detail')
     ws.cell(row=row, column=1).font = Font(bold=True, size=14)
@@ -1560,22 +1662,22 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
     row += 1
     ws.cell(row=row, column=1, value=exam.title or '')
     row += 1
-    ws.cell(row=row, column=1, value=timezone.now().strftime('%m/%d/%Y %H:%M'))
+    ws.cell(row=row, column=1, value=_report_datetime_ist())
     row += 1
     for label, col_b in [
-        ('Sl No.', 'd'),
+        ('Sl No.', ''),
         ('Exam Unique Id', str(exam.id)),
         ('Exam Name', exam.title or ''),
-        ('Theme', 'd'),
-        ('Faculty', 'd'),
+        ('Theme', ''),
+        ('Faculty', ''),
         ('Subject', exam.title or ''),
-        ('Batch', 'd'),
+        ('Batch', ''),
     ]:
         ws.cell(row=row, column=1, value=label)
         ws.cell(row=row, column=2, value=col_b)
         row += 1
     # Table header row: Keypad No., Name, then only detail columns that have data (excl. name/clicker_id), then Score, Correct Rate, Ranking, then question columns
-    user_rows = [_participant_report_row(ep.participant) for ep in assigned]
+    user_rows = [_participant_report_row(ep.participant) for ep in assigned_sorted]
     detail_columns = _participant_detail_columns_with_data(user_rows)
     detail_columns_no_id = [(label, key) for (label, key) in detail_columns if key not in ('name', 'clicker_id')]
     headers = ['Keypad No.', 'Name'] + [label for (label, _) in detail_columns_no_id] + ['Score', 'Correct Rate', 'Ranking']
@@ -1585,13 +1687,14 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
         ws.cell(row=row, column=col, value=h)
     row += 1
 
-    for ep in assigned:
+    for ep in assigned_sorted:
         p = ep.participant
         user_row = _participant_report_row(p)
         attempt = attempts_by_participant.get(p.id)
         if attempt:
             score_val = float(attempt.score)
-            correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
+            # Client format: Correct Rate as proportion (0-1), e.g. 0.75
+            correct_rate = (attempt.correct_answers / attempt.total_questions) if attempt.total_questions else 0
             rank_val = rank_by_attempt.get(attempt.id, '')
         else:
             score_val = 'ABSENT'
@@ -1615,16 +1718,16 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
         for eq in exam_questions:
             if attempt:
                 ans = answer_map.get((attempt.id, eq.question_id))
-                if ans and ans.is_correct:
-                    q_score = float(eq.positive_marks)
-                    cell = ws.cell(row=row, column=col, value=q_score)
-                    cell.fill = green_fill
-                elif ans:
-                    q_score = -float(eq.negative_marks)
-                    cell = ws.cell(row=row, column=col, value=q_score)
-                    cell.fill = red_fill
+                if ans:
+                    attempted_label = _format_attempted_option_label(eq.question, ans.selected_answer)
+                    if ans.is_correct:
+                        cell = ws.cell(row=row, column=col, value=attempted_label)
+                        cell.fill = green_fill
+                    else:
+                        cell = ws.cell(row=row, column=col, value=attempted_label)
+                        cell.fill = red_fill
                 else:
-                    cell = ws.cell(row=row, column=col, value='')
+                    ws.cell(row=row, column=col, value='')
                 col += 1
             else:
                 ws.cell(row=row, column=col, value='')
@@ -1659,6 +1762,9 @@ def _build_export_http_response(request, exam):
     export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
     df = df[[c for c in export_columns if c in df.columns]]
+    # Ensure ranking order (rank 1 first)
+    if 'rank' in df.columns:
+        df = df.sort_values('rank', ascending=True)
     output = BytesIO()
     if format_type == 'excel':
         content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -1667,9 +1773,6 @@ def _build_export_http_response(request, exam):
                 _write_personal_achievement_and_detail_sheet(writer.book, exam)
                 filename = f'report-{exam.id}-personal-achievement.xlsx'
             else:
-                df.to_excel(writer, sheet_name='Participant Results', index=False)
-                qa_df = pd.DataFrame(report_data['question_analysis'])
-                qa_df.to_excel(writer, sheet_name='Question Analysis', index=False)
                 _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
                 filename = f'report-{exam.id}.xlsx'
     else:
@@ -1711,6 +1814,9 @@ def _build_export_file_response(format_type, exam, layout=None):
     export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
     df = df[[c for c in export_columns if c in df.columns]]
+    # Ensure ranking order (rank 1 first)
+    if 'rank' in df.columns:
+        df = df.sort_values('rank', ascending=True)
     output = BytesIO()
     if format_type == 'excel':
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -1730,9 +1836,6 @@ def _build_export_file_response(format_type, exam, layout=None):
                 _write_personal_achievement_and_detail_sheet(writer.book, exam)
                 filename = f'report-{exam.id}-personal-achievement.xlsx'
             else:
-                df.to_excel(writer, sheet_name='Participant Results', index=False)
-                qa_df = pd.DataFrame(report_data['question_analysis'])
-                qa_df.to_excel(writer, sheet_name='Question Analysis', index=False)
                 _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
                 filename = f'report-{exam.id}.xlsx'
         content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
