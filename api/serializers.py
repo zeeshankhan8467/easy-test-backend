@@ -313,6 +313,10 @@ class QuestionAnalysisSerializer(serializers.Serializer):
     correct_attempts = serializers.IntegerField()
     accuracy = serializers.FloatField()
     average_time = serializers.FloatField()
+    options = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    option_display = serializers.CharField(required=False, default='alpha')
+    correct_answer = serializers.ListField(required=False, allow_null=True)
+    option_votes = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
 
 
 class ParticipantResultSerializer(serializers.Serializer):
