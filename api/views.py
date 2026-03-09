@@ -1394,7 +1394,7 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
     white_font = Font(color='FFFFFF', bold=True)
 
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
-    attempts = list(ExamAttempt.objects.filter(exam=exam).order_by('-score', 'time_taken').select_related('participant'))
+    attempts = list(ExamAttempt.objects.filter(exam=exam).order_by('participant__clicker_id').select_related('participant'))
     answer_map = {}
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
@@ -1500,7 +1500,7 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
     bold_font = Font(bold=True)
 
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
-    attempts = list(ExamAttempt.objects.filter(exam=exam).order_by('-score', 'time_taken').select_related('participant'))
+    attempts = list(ExamAttempt.objects.filter(exam=exam).order_by('participant__clicker_id').select_related('participant'))
     answer_map = {}
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
@@ -1734,14 +1734,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
     rank_by_attempt = {a.id: idx + 1 for idx, a in enumerate(attempted_list)}
     voted_count = len(attempted_list)
 
-    # Order assigned by ranking (rank 1 first, then 2, 3...; absent at end)
-    def _rank_sort_key(ep):
-        if ep.participant_id not in attempts_by_participant:
-            return (1, 999999)  # absent last
-        att = attempts_by_participant[ep.participant_id]
-        return (0, rank_by_attempt.get(att.id, 999999))
-
-    assigned_sorted = sorted(assigned, key=_rank_sort_key)
+    assigned_sorted = sorted(assigned, key=lambda ep: ep.participant.clicker_id or '')
 
     row = 1
     ws.cell(row=row, column=1, value='Personal Achievement and Detail')
@@ -1782,8 +1775,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
         attempt = attempts_by_participant.get(p.id)
         if attempt:
             score_val = float(attempt.score)
-            # Client format: Correct Rate as proportion (0-1), e.g. 0.75
-            correct_rate = (attempt.correct_answers / attempt.total_questions) if attempt.total_questions else 0
+            correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
             rank_val = rank_by_attempt.get(attempt.id, '')
         else:
             score_val = 'ABSENT'
@@ -1800,7 +1792,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
             col += 1
         ws.cell(row=row, column=col, value=score_val)
         col += 1
-        ws.cell(row=row, column=col, value=correct_rate if attempt else 0)
+        ws.cell(row=row, column=col, value=f'{correct_rate:.2f}%' if attempt else '0.00%')
         col += 1
         ws.cell(row=row, column=col, value=rank_val)
         col += 1
