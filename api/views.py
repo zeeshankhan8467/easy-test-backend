@@ -520,16 +520,15 @@ class ExamViewSet(viewsets.ModelViewSet):
                     attempt.time_taken = max(0, int((last_ans.answered_at - attempt.started_at).total_seconds()))
             attempt.save()
 
-        # Mark attendance for listed participants (at least one response already marks present; this can add late-joiners)
+        # Assign all listed participants to the exam and mark present those who responded
         for pid in attendance_ids:
             try:
                 p = Participant.objects.get(id=pid)
-                if ExamParticipant.objects.filter(exam=exam, participant=p).exists():
-                    ExamAttempt.objects.get_or_create(
-                        exam=exam,
-                        participant=p,
-                        defaults={'total_questions': len(snapshot_questions), 'submitted_at': timezone.now()}
-                    )
+                ExamParticipant.objects.get_or_create(exam=exam, participant=p)
+                if pid in created_attempts:
+                    continue
+                if ExamAttempt.objects.filter(exam=exam, participant=p).exists():
+                    continue
             except Participant.DoesNotExist:
                 pass
 
