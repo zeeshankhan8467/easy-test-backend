@@ -1398,6 +1398,14 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
+    # Rank by score (desc), then time_taken (asc: faster = better). Rank 1 = best.
+    attempts_ranked = sorted(
+        ExamAttempt.objects.filter(exam=exam).values_list('id', 'score', 'time_taken'),
+        key=lambda x: (-float(x[1]), x[2] or 0)
+    )
+    rank_by_attempt_id = {aid: rank for rank, (aid, _s, _t) in enumerate(attempts_ranked, 1)}
+    total_participants = len(attempts_ranked)
+
     row_num = 1
     ws.cell(row=row_num, column=1, value='Results by Participants(Detail)')
     ws.cell(row=row_num, column=1).font = Font(bold=True, size=14)
@@ -1434,7 +1442,7 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
         correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
         ws.cell(row=row_num, column=1, value=detail_line)
         ws.cell(row=row_num, column=2, value=f'Correct Rate: {correct_rate:.2f}%')
-        ws.cell(row=row_num, column=3, value=f'Ranking: {attempt.correct_answers}/{attempt.total_questions}')
+        ws.cell(row=row_num, column=3, value=f'Ranking: {rank_by_attempt_id.get(attempt.id, "")}/{total_participants}')
         row_num += 1
         # Table header: Question, Option, Response, Slide Type, Correct Answer, Speed, Score
         headers = ['Question', 'Option', 'Response', 'Slide Type', 'Correct Answer', 'Speed', 'Score']
@@ -1458,7 +1466,8 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
                     response_val = (sel[0] + 1) if sel else ''
                 else:
                     response_val = int(sel) + 1 if sel is not None else ''
-                speed = round(answer.time_taken, 2) if answer.time_taken is not None else ''
+                # Speed = time taken for this question in seconds (integer from DB)
+                speed = answer.time_taken if answer.time_taken is not None else 0
                 score = int(eq.positive_marks) if answer.is_correct else -int(eq.negative_marks)
             else:
                 response_val = ''
@@ -1504,6 +1513,14 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
+    # Rank by score (desc), then time_taken (asc). Rank 1 = best.
+    attempts_ranked = sorted(
+        ExamAttempt.objects.filter(exam=exam).values_list('id', 'score', 'time_taken'),
+        key=lambda x: (-float(x[1]), x[2] or 0)
+    )
+    rank_by_attempt_id = {aid: rank for rank, (aid, _s, _t) in enumerate(attempts_ranked, 1)}
+    total_participants = len(attempts_ranked)
+
     n_questions = len(exam_questions)
     report_date = _report_datetime_ist()
 
@@ -1547,7 +1564,7 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
         correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
         ws.cell(row=row, column=1, value=detail_line)
         ws.cell(row=row, column=2, value=f'Correct Rate: {correct_rate:.2f}%')
-        ws.cell(row=row, column=3, value=f'Ranking: {attempt.correct_answers}/{attempt.total_questions}')
+        ws.cell(row=row, column=3, value=f'Ranking: {rank_by_attempt_id.get(attempt.id, "")}/{total_participants}')
         row += 1
         # Table header
         headers = ['Question', 'Option', 'Response', 'Slide Type', 'Correct Answer', 'Speed', 'Score']
@@ -1572,7 +1589,8 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
                     response_val = (sel[0] + 1) if sel else ''
                 else:
                     response_val = int(sel) + 1 if sel is not None else ''
-                speed = round(answer.time_taken, 2) if answer.time_taken is not None else ''
+                # Speed = time taken for this question in seconds
+                speed = answer.time_taken if answer.time_taken is not None else 0
                 score = int(eq.positive_marks) if answer.is_correct else -int(eq.negative_marks)
             else:
                 response_val = ''
