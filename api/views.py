@@ -1824,9 +1824,18 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
 
 
 def _answer_is_correct(selected, correct_answer):
-    """Return True if selected answer matches correct_answer (int or list)."""
+    """Return True if selected answer matches correct_answer (int or list).
+    selected_answer in DB is often stored as list for MCQ (e.g. [1]); correct_answer may be int or list.
+    """
+    if selected is None or correct_answer is None:
+        return False
+    # Normalize when correct_answer is list (multiple correct)
     if isinstance(correct_answer, list):
-        return isinstance(selected, list) and set(selected) == set(correct_answer)
+        sel_list = selected if isinstance(selected, list) else [selected]
+        return set(sel_list) == set(correct_answer)
+    # MCQ: correct_answer is int; selected may be int or single-element list from DB
+    if isinstance(selected, list):
+        return len(selected) == 1 and selected[0] == correct_answer
     return selected == correct_answer
 
 
