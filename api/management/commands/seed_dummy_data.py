@@ -15,20 +15,21 @@ from django.contrib.auth.models import User
 
 from api.models import (
     Exam, Question, ExamQuestion, Participant,
-    ExamParticipant, ExamAttempt, Answer,
+    ExamParticipant, ExamAttempt, Answer, School, UserProfile,
+    ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN, ROLE_TEACHER,
 )
 
 
 # ─── Participants: simple data for easy verification ─────────────────────────
 # Each has obvious values: Student 1 → roll 1, clicker_id 1, class 6, etc.
 PARTICIPANTS_DATA = [
-    {"name": "Student 1", "clicker_id": "1", "email": "student1@test.com", "roll_no": "1", "admission_no": "ADM001", "class": "6", "section": "A", "teacher_name": "Teacher A"},
-    {"name": "Student 2", "clicker_id": "2", "email": "student2@test.com", "roll_no": "2", "admission_no": "ADM002", "class": "6", "section": "A", "teacher_name": "Teacher A"},
-    {"name": "Student 3", "clicker_id": "3", "email": "student3@test.com", "roll_no": "3", "admission_no": "ADM003", "class": "6", "section": "B", "teacher_name": "Teacher B"},
-    {"name": "Student 4", "clicker_id": "4", "email": "student4@test.com", "roll_no": "4", "admission_no": "ADM004", "class": "7", "section": "A", "teacher_name": "Teacher B"},
-    {"name": "Student 5", "clicker_id": "5", "email": "student5@test.com", "roll_no": "5", "admission_no": "ADM005", "class": "7", "section": "B", "teacher_name": "Teacher A"},
+    {"name": "Student 1", "clicker_id": "1", "email": "student1@test.com", "parent_email_id": "parent1@test.com", "roll_no": "1", "admission_no": "ADM001", "class": "6", "section": "A", "teacher_name": "Teacher A"},
+    {"name": "Student 2", "clicker_id": "2", "email": "student2@test.com", "parent_email_id": "parent2@test.com", "roll_no": "2", "admission_no": "ADM002", "class": "6", "section": "A", "teacher_name": "Teacher A"},
+    {"name": "Student 3", "clicker_id": "3", "email": "student3@test.com", "parent_email_id": "parent3@test.com", "roll_no": "3", "admission_no": "ADM003", "class": "6", "section": "B", "teacher_name": "Teacher B"},
+    {"name": "Student 4", "clicker_id": "4", "email": "student4@test.com", "parent_email_id": "parent4@test.com", "roll_no": "4", "admission_no": "ADM004", "class": "7", "section": "A", "teacher_name": "Teacher B"},
+    {"name": "Student 5", "clicker_id": "5", "email": "student5@test.com", "parent_email_id": "parent5@test.com", "roll_no": "5", "admission_no": "ADM005", "class": "7", "section": "B", "teacher_name": "Teacher A"},
 ]
-EXTRA_KEYS = ["roll_no", "admission_no", "class", "subject", "section", "team", "group", "house", "gender", "city", "uid", "employee_code", "teacher_name", "email_id"]
+EXTRA_KEYS = ["roll_no", "admission_no", "class", "subject", "section", "team", "group", "house", "gender", "city", "uid", "employee_code", "teacher_name", "email_id", "parent_email_id"]
 
 # ─── Question bank: multiple choice only (mcq) ─────────────────────────────
 # Each tuple: (text, type, options, correct_answer, difficulty, option_display)
@@ -51,7 +52,18 @@ EXAMS_CONFIG = [
 ]
 
 
+# RBAC: default login credentials for seed users
+SUPER_ADMIN_EMAIL = 'superadmin@easytest.com'
+SUPER_ADMIN_PASSWORD = 'EasyTest@123'
+SCHOOL_ADMIN_EMAIL = 'schooladmin@easytest.com'
+SCHOOL_ADMIN_PASSWORD = 'EasyTest@123'
+TEACHER_EMAIL = 'teacher@easytest.com'
+TEACHER_PASSWORD = 'EasyTest@123'
+DEMO_SCHOOL_NAME = 'Demo School'
+
+
 def get_or_create_user():
+    """Return a user for creating exams (prefer superuser with super_admin profile)."""
     user = User.objects.filter(is_superuser=True).first()
     if not user:
         user = User.objects.filter(is_staff=True).first()
@@ -60,7 +72,84 @@ def get_or_create_user():
     return user
 
 
-def create_participants(stdout):
+def create_rbac_users(stdout, teacher_email: str = TEACHER_EMAIL, teacher_password: str = TEACHER_PASSWORD):
+    """Create Demo School, Super Admin, School Admin, and Teacher. Returns (school, teacher_user)."""
+    school, _ = School.objects.get_or_create(
+        name=DEMO_SCHOOL_NAME,
+        defaults={}
+    )
+    stdout.write(f"  School: '{school.name}' (id={school.id})")
+
+    super_user = User.objects.filter(email=SUPER_ADMIN_EMAIL).first()
+    if not super_user:
+        super_user = User.objects.create_user(
+            username=SUPER_ADMIN_EMAIL,
+            email=SUPER_ADMIN_EMAIL,
+            password=SUPER_ADMIN_PASSWORD,
+            first_name='Super',
+            last_name='Admin',
+            is_staff=True,
+            is_superuser=True,
+        )
+        stdout.write(f"  Created Super Admin: {SUPER_ADMIN_EMAIL}")
+    else:
+        super_user.set_password(SUPER_ADMIN_PASSWORD)
+        super_user.save()
+    profile, _ = UserProfile.objects.get_or_create(user=super_user, defaults={'role': ROLE_SUPER_ADMIN})
+    if profile.role != ROLE_SUPER_ADMIN:
+        profile.role = ROLE_SUPER_ADMIN
+        profile.school = None
+        profile.save()
+
+    school_admin_user = User.objects.filter(email=SCHOOL_ADMIN_EMAIL).first()
+    if not school_admin_user:
+        school_admin_user = User.objects.create_user(
+            username=SCHOOL_ADMIN_EMAIL,
+            email=SCHOOL_ADMIN_EMAIL,
+            password=SCHOOL_ADMIN_PASSWORD,
+            first_name='School',
+            last_name='Admin',
+        )
+        stdout.write(f"  Created School Admin: {SCHOOL_ADMIN_EMAIL}")
+    else:
+        school_admin_user.set_password(SCHOOL_ADMIN_PASSWORD)
+        school_admin_user.save()
+    profile, _ = UserProfile.objects.get_or_create(user=school_admin_user, defaults={'role': ROLE_SCHOOL_ADMIN, 'school': school})
+    if profile.role != ROLE_SCHOOL_ADMIN or profile.school_id != school.id:
+        profile.role = ROLE_SCHOOL_ADMIN
+        profile.school = school
+        profile.save()
+
+    teacher_email = (teacher_email or TEACHER_EMAIL).strip().lower()
+    teacher_password = teacher_password or TEACHER_PASSWORD
+
+    teacher_user = User.objects.filter(email=teacher_email).first()
+    if not teacher_user:
+        teacher_user = User.objects.create_user(
+            username=teacher_email,
+            email=teacher_email,
+            password=teacher_password,
+            first_name='Demo',
+            last_name='Teacher',
+        )
+        stdout.write(f"  Created Teacher: {teacher_email}")
+    else:
+        teacher_user.set_password(teacher_password)
+        teacher_user.save()
+    profile, _ = UserProfile.objects.get_or_create(user=teacher_user, defaults={'role': ROLE_TEACHER, 'school': school})
+    if profile.role != ROLE_TEACHER or profile.school_id != school.id:
+        profile.role = ROLE_TEACHER
+        profile.school = school
+        profile.save()
+
+    stdout.write(
+        "  RBAC logins: superadmin@easytest.com (Super Admin), schooladmin@easytest.com (School Admin), "
+        f"{teacher_email} (Teacher). Password: {teacher_password}"
+    )
+    return school, teacher_user
+
+
+def create_participants(stdout, school=None, created_by=None):
     created = []
     for data in PARTICIPANTS_DATA:
         clicker_id = data["clicker_id"]
@@ -82,6 +171,10 @@ def create_participants(stdout):
                 email = None
             p.name = name
             p.email = email
+            if school is not None:
+                p.school = school
+            if created_by is not None:
+                p.created_by = created_by
             p.extra = extra
             p.save()
             is_new = False
@@ -94,7 +187,9 @@ def create_participants(stdout):
                 name=name,
                 clicker_id=clicker_id,
                 email=email,
+                school=school,
                 extra=extra,
+                created_by=created_by,
             )
             is_new = True
         if is_new:
@@ -133,6 +228,9 @@ def freeze_exam_with_snapshot(exam, exam_questions):
         "description": exam.description,
         "duration": exam.duration,
         "revisable": exam.revisable,
+        "show_live_response": getattr(exam, "show_live_response", False),
+        "show_response_after_completion": getattr(exam, "show_response_after_completion", True),
+        "question_change_automatic": getattr(exam, "question_change_automatic", False),
         "frozen_at": timezone.now().isoformat(),
         "questions": [],
     }
@@ -241,27 +339,39 @@ class Command(BaseCommand):
             action="store_true",
             help="Remove dummy data (exams with 'Dummy' or seed titles, then re-seed).",
         )
+        parser.add_argument(
+            "--teacher-email",
+            default=TEACHER_EMAIL,
+            help="Teacher email to own the seeded exams (default: teacher@easytest.com).",
+        )
+        parser.add_argument(
+            "--teacher-password",
+            default=TEACHER_PASSWORD,
+            help="Teacher password to set/update for the teacher user (default: EasyTest@123).",
+        )
 
     def handle(self, *args, **options):
-        user = get_or_create_user()
-        if not user:
-            self.stdout.write(self.style.ERROR("No user found. Create a user first: python manage.py createsuperuser"))
-            return
+        teacher_email = (options.get("teacher_email") or TEACHER_EMAIL).strip().lower()
+        teacher_password = options.get("teacher_password") or TEACHER_PASSWORD
 
         dummy_titles = [c[0] for c in EXAMS_CONFIG]
+        # Ensure RBAC users exist (including the requested teacher) before we clear/seed exams.
+        demo_school, teacher_user = create_rbac_users(self.stdout, teacher_email=teacher_email, teacher_password=teacher_password)
+        user = teacher_user
+
         if options.get("clear"):
             deleted_exams = Exam.objects.filter(title__in=dummy_titles, created_by=user).count()
             Exam.objects.filter(title__in=dummy_titles, created_by=user).delete()
-            self.stdout.write(self.style.WARNING(f"Cleared {deleted_exams} dummy exam(s)."))
+            self.stdout.write(self.style.WARNING(f"Cleared {deleted_exams} dummy exam(s) for {teacher_email}."))
 
         if options.get("skip_existing") and Exam.objects.filter(title="Simple Frozen Exam", created_by=user).exists():
-            self.stdout.write("Dummy data already exists (--skip-existing). Done.")
+            self.stdout.write(f"Dummy data already exists (--skip-existing) for {teacher_email}. Done.")
             return
 
         self.stdout.write("Seeding dummy data...")
 
-        # 1. Participants
-        participants = create_participants(self.stdout)
+        # 1. Participants (link to demo school so School Admin/Teacher can see them)
+        participants = create_participants(self.stdout, demo_school, created_by=user)
 
         # 2. Question bank
         questions = create_questions(self.stdout)
@@ -269,18 +379,24 @@ class Command(BaseCommand):
 
         # 3. Exams: create each and link questions + participants
         for title, description, duration, revisable, status in EXAMS_CONFIG:
+            defaults = {
+                "description": description,
+                "duration": duration,
+                "revisable": revisable,
+                "status": "draft",
+                "positive_marking": Decimal("1.0"),
+                "negative_marking": Decimal("0.25"),
+            }
+            if demo_school := School.objects.filter(name=DEMO_SCHOOL_NAME).first():
+                defaults["school_id"] = demo_school.id
             exam, exam_created = Exam.objects.get_or_create(
                 title=title,
                 created_by=user,
-                defaults={
-                    "description": description,
-                    "duration": duration,
-                    "revisable": revisable,
-                    "status": "draft",
-                    "positive_marking": Decimal("1.0"),
-                    "negative_marking": Decimal("0.25"),
-                }
+                defaults=defaults,
             )
+            if not exam_created and demo_school and exam.school_id is None:
+                exam.school = demo_school
+                exam.save(update_fields=["school_id"])
             if not exam_created and options.get("skip_existing"):
                 continue
 
@@ -325,7 +441,11 @@ class Command(BaseCommand):
                 if status == "completed":
                     exam.status = "completed"
                     exam.save()
-                create_attempts_and_answers(exam, assign, exam_questions, self.stdout)
+                # Make attendance meaningful:
+                # - Frozen exam: only first 3 students attempt (present), rest absent
+                # - Completed exam: everyone attempts
+                attempt_participants = assign[:3] if status == "frozen" else assign
+                create_attempts_and_answers(exam, attempt_participants, exam_questions, self.stdout)
 
         self.stdout.write(self.style.SUCCESS(
             "Done. Simple seed data created. Verify: Participants (Student 1–5, clicker_id 1–5, roll_no 1–5), "

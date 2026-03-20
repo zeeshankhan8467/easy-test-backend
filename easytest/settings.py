@@ -170,3 +170,26 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
+
+# Email (used for parent notifications)
+# IMPORTANT: If SMTP envs are set, use SMTP even when DEBUG=True.
+# Only fall back to console backend when no EMAIL_HOST is configured.
+_email_backend_env = (os.getenv('EMAIL_BACKEND', '') or '').strip()
+_email_host = (os.getenv('EMAIL_HOST', '') or '').strip()
+
+EMAIL_BACKEND = (
+    _email_backend_env
+    if _email_backend_env
+    else (
+        'django.core.mail.backends.smtp.EmailBackend'
+        if _email_host
+        else 'django.core.mail.backends.console.EmailBackend'
+    )
+)
+
+EMAIL_HOST = _email_host
+EMAIL_PORT = int((os.getenv('EMAIL_PORT', '587') or '587').strip())
+EMAIL_HOST_USER = (os.getenv('EMAIL_HOST_USER', '') or '').strip()
+EMAIL_HOST_PASSWORD = (os.getenv('EMAIL_HOST_PASSWORD', '') or '').strip()
+EMAIL_USE_TLS = (os.getenv('EMAIL_USE_TLS', 'True') or 'True').strip() == 'True'
+DEFAULT_FROM_EMAIL = (os.getenv('DEFAULT_FROM_EMAIL', '') or '').strip() or (EMAIL_HOST_USER or 'no-reply@easytestlive.com')

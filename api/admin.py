@@ -1,8 +1,25 @@
 from django.contrib import admin
 from .models import (
     Exam, Question, ExamQuestion, Participant,
-    ExamParticipant, ExamAttempt, Answer
+    ExamParticipant, ExamAttempt, Answer, School, UserProfile
 )
+
+
+@admin.register(School)
+class SchoolAdmin(admin.ModelAdmin):
+    list_display = ['name', 'created_at']
+    search_fields = ['name']
+
+
+@admin.register(UserProfile)
+class UserProfileAdmin(admin.ModelAdmin):
+    list_display = ['user', 'role', 'school', 'get_email']
+    list_filter = ['role', 'school']
+    search_fields = ['user__email', 'user__username']
+
+    def get_email(self, obj):
+        return obj.user.email if obj.user else ''
+    get_email.short_description = 'Email'
 
 
 @admin.register(Exam)

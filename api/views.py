@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, renderers
+from rest_framework import viewsets, status, renderers, serializers as drf_serializers
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -17,6 +17,7 @@ from django.db.models.functions import Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_GET
+from django.core.mail import EmailMessage
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from datetime import timedelta
 import pandas as pd
@@ -27,12 +28,21 @@ import html as html_module
 from io import BytesIO
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
 
 logger = logging.getLogger(__name__)
 
 from .models import (
     Exam, Question, ExamQuestion, Participant,
-    ExamParticipant, ExamAttempt, Answer
+    ExamParticipant, ExamAttempt, Answer, School, UserProfile,
+    ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN, ROLE_TEACHER,
+)
+from .permissions import (
+    scope_exams_queryset, scope_participants_queryset, scope_schools_queryset,
+    can_create_school_admin, can_create_teacher, get_user_school_id, get_user_role,
 )
 from .serializers import (
     UserSerializer, LoginSerializer, ExamSerializer, ExamCreateUpdateSerializer,
@@ -40,7 +50,7 @@ from .serializers import (
     ExamAttemptSerializer, QuestionAnalysisSerializer, ParticipantResultSerializer,
     ExamReportSerializer, DashboardStatsSerializer, RecentExamSerializer,
     PerformanceDataSerializer, DashboardDataSerializer, LeaderboardEntrySerializer,
-    LeaderboardSerializer
+    LeaderboardSerializer, SchoolSerializer, CreateSchoolAdminSerializer, CreateTeacherSerializer,
 )
 
 
@@ -67,7 +77,31 @@ class ExamViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return Exam.objects.filter(created_by=self.request.user).prefetch_related('exam_questions__question')
+        qs = Exam.objects.all().prefetch_related('exam_questions__question').select_related('school', 'created_by')
+        qs = scope_exams_queryset(qs, self.request.user)
+        role = get_user_role(self.request.user)
+        params = self.request.query_params
+        if role == ROLE_SUPER_ADMIN:
+            school_id = params.get('school_id')
+            if school_id is not None and school_id != '':
+                try:
+                    qs = qs.filter(school_id=int(school_id))
+                except (ValueError, TypeError):
+                    pass
+            owner_user_id = params.get('owner_user_id')
+            if owner_user_id is not None and owner_user_id != '':
+                try:
+                    qs = qs.filter(created_by_id=int(owner_user_id))
+                except (ValueError, TypeError):
+                    pass
+        elif role == ROLE_SCHOOL_ADMIN:
+            owner_user_id = params.get('owner_user_id')
+            if owner_user_id is not None and owner_user_id != '':
+                try:
+                    qs = qs.filter(created_by_id=int(owner_user_id))
+                except (ValueError, TypeError):
+                    pass
+        return qs
     
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
@@ -135,6 +169,9 @@ class ExamViewSet(viewsets.ModelViewSet):
             'description': exam.description,
             'duration': exam.duration,
             'revisable': exam.revisable,
+            'show_live_response': getattr(exam, 'show_live_response', False),
+            'show_response_after_completion': getattr(exam, 'show_response_after_completion', True),
+            'question_change_automatic': getattr(exam, 'question_change_automatic', False),
             'option_display': option_display,
             'frozen_at': timezone.now().isoformat(),
             'questions': []
@@ -182,14 +219,28 @@ class ExamViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def available_questions(self, request):
-        """Get available questions for selection (not already in exam)"""
+        """Get available questions for selection (not already in exam). Scoped by role."""
         exam_id = request.query_params.get('exam_id')
         difficulty = request.query_params.get('difficulty')
         qtype = request.query_params.get('type')
         search = request.query_params.get('search', '')
-        
-        queryset = Question.objects.all()
-        
+
+        # Scope by role: Super Admin all, School Admin same school, Teacher own only
+        user = request.user
+        role = get_user_role(user)
+        if role == ROLE_SUPER_ADMIN:
+            queryset = Question.objects.all()
+        elif role == ROLE_SCHOOL_ADMIN:
+            school_id = get_user_school_id(user)
+            if not school_id:
+                queryset = Question.objects.none()
+            else:
+                queryset = Question.objects.filter(created_by__profile__school_id=school_id)
+        elif role == ROLE_TEACHER:
+            queryset = Question.objects.filter(created_by=user)
+        else:
+            queryset = Question.objects.filter(created_by=user)
+
         # Filter by difficulty
         if difficulty and difficulty != 'all':
             queryset = queryset.filter(difficulty=difficulty)
@@ -222,6 +273,9 @@ class ExamViewSet(viewsets.ModelViewSet):
         if exam.snapshot_data:
             snapshot_data = exam.snapshot_data
             snapshot_data.setdefault('option_display', 'alpha')
+            snapshot_data.setdefault('show_live_response', False)
+            snapshot_data.setdefault('show_response_after_completion', True)
+            snapshot_data.setdefault('question_change_automatic', False)
         else:
             questions = exam.exam_questions.select_related('question').order_by('order')
             snapshot_data = {
@@ -230,6 +284,9 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'description': exam.description,
                 'duration': exam.duration,
                 'revisable': exam.revisable,
+                'show_live_response': getattr(exam, 'show_live_response', False),
+                'show_response_after_completion': getattr(exam, 'show_response_after_completion', True),
+            'question_change_automatic': getattr(exam, 'question_change_automatic', False),
                 'option_display': 'alpha',
                 'generated_at': timezone.now().isoformat(),
                 'questions': []
@@ -562,10 +619,13 @@ class ExamViewSet(viewsets.ModelViewSet):
         participants = []
         for ep in assigned:
             p = ep.participant
+            extra = p.extra or {}
             participants.append({
                 'id': p.id,
                 'name': p.name,
                 'email': p.email,
+                'clicker_id': p.clicker_id,
+                'parent_email_id': extra.get('parent_email_id', '') if isinstance(extra, dict) else '',
                 'present': p.id in present_ids,
             })
         present_count = len(present_ids)
@@ -578,12 +638,185 @@ class ExamViewSet(viewsets.ModelViewSet):
             'total_count': total_count,
         })
 
+    @action(detail=True, methods=['get'], url_path='attendance/export')
+    def attendance_export(self, request, pk=None):
+        """
+        GET /api/exams/{id}/attendance/export/?format=excel|pdf
+        Downloads Attendance report as Excel or PDF.
+        """
+        exam = self.get_object()
+        # IMPORTANT: DRF uses `?format=` for content negotiation; using it breaks this endpoint.
+        # Use `file_format` instead (keep `format` as fallback for older clients).
+        raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
+        format_type = 'pdf' if raw in ('pdf',) else 'excel'
+
+        assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
+        present_ids = set(ExamAttempt.objects.filter(exam=exam).values_list('participant_id', flat=True))
+
+        rows = []
+        for ep in assigned:
+            p = ep.participant
+            extra = p.extra or {}
+            status_label = 'Present' if p.id in present_ids else 'Absent'
+            rows.append({
+                'Name': p.name,
+                'Keypad ID': p.clicker_id,
+                'Email': p.email or '',
+                'Parent Email ID': extra.get('parent_email_id', '') if isinstance(extra, dict) else '',
+                'Status': status_label,
+            })
+
+        filename_base = f'attendance-{exam.id}'
+        if format_type == 'excel':
+            output = BytesIO()
+            df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Status'])
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Attendance', index=False)
+            output.seek(0)
+            response = HttpResponse(output.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            response['Content-Disposition'] = f'attachment; filename="{filename_base}.xlsx"'
+            return response
+
+        # PDF
+        output = BytesIO()
+        doc = SimpleDocTemplate(output, pagesize=A4)
+        styles = getSampleStyleSheet()
+        elements = [
+            Paragraph(f'Attendance Report - {exam.title}', styles['Title']),
+            Spacer(1, 12),
+            Paragraph(f'Generated at: {timezone.now().strftime("%d/%m/%Y %H:%M")}', styles['Normal']),
+            Spacer(1, 12),
+        ]
+
+        table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Status']] + [
+            [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Status']] for r in rows
+        ]
+        table = Table(table_data, repeatRows=1, hAlign='LEFT')
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+            ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ]))
+        elements.append(table)
+        doc.build(elements)
+        output.seek(0)
+
+        response = HttpResponse(output.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename_base}.pdf"'
+        return response
+
+    @action(detail=True, methods=['post'], url_path='attendance/send-parent-emails')
+    def send_parent_emails(self, request, pk=None):
+        """
+        POST /api/exams/{id}/attendance/send-parent-emails/
+        Body:
+          {
+            "scope": "present" | "absent" | "all",
+            "subject": "...",
+            "body": ".... {{exam_title}} {{student_name}} {{clicker_id}} {{status}} ..."
+          }
+        Sends emails to Participant.extra.parent_email_id for assigned participants.
+        """
+        exam = self.get_object()
+        scope = (request.data.get('scope') or 'absent').strip().lower()
+        participant_ids = request.data.get('participant_ids', None)
+        subject = (request.data.get('subject') or '').strip()
+        body = (request.data.get('body') or '').strip()
+        if scope not in ('present', 'absent', 'all'):
+            return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+        if participant_ids is not None and not isinstance(participant_ids, list):
+            return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+        if not subject:
+            return Response({'error': 'Subject is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not body:
+            return Response({'error': 'Body is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
+        if participant_ids:
+            try:
+                ids = [int(x) for x in participant_ids]
+            except Exception:
+                return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+            assigned = assigned.filter(participant_id__in=ids)
+        present_ids = set(ExamAttempt.objects.filter(exam=exam).values_list('participant_id', flat=True))
+
+        sent = 0
+        skipped = 0
+        errors = []
+
+        def _render(template: str, ctx: dict) -> str:
+            out = template
+            for k, v in ctx.items():
+                out = out.replace('{{' + k + '}}', str(v))
+            return out
+
+        for ep in assigned:
+            p = ep.participant
+            is_present = p.id in present_ids
+            if scope == 'present' and not is_present:
+                continue
+            if scope == 'absent' and is_present:
+                continue
+
+            extra = p.extra or {}
+            parent_email = extra.get('parent_email_id') if isinstance(extra, dict) else None
+            parent_email = (parent_email or '').strip()
+            if not parent_email:
+                skipped += 1
+                continue
+
+            ctx = {
+                'exam_title': exam.title,
+                'student_name': p.name,
+                'clicker_id': p.clicker_id,
+                'status': 'Present' if is_present else 'Absent',
+            }
+            msg = EmailMessage(
+                subject=_render(subject, ctx),
+                body=_render(body, ctx),
+                to=[parent_email],
+            )
+            try:
+                msg.send(fail_silently=False)
+                sent += 1
+            except Exception as e:
+                errors.append(f'Participant {p.id}: {str(e)}')
+
+        return Response({'sent': sent, 'skipped': skipped, 'errors': errors})
+
 
 # Question Views
 class QuestionViewSet(viewsets.ModelViewSet):
-    queryset = Question.objects.all()
     serializer_class = QuestionSerializer
     permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        """Set created_by when a question is created manually."""
+        serializer.save(created_by=self.request.user)
+
+    def get_queryset(self):
+        """Scope questions by role.
+
+        - Super Admin: all questions
+        - School Admin: questions created by users in their school
+        - Teacher: only questions they created
+        """
+        qs = Question.objects.all()
+        user = self.request.user
+        role = get_user_role(user)
+        if role == ROLE_SUPER_ADMIN:
+            return qs
+        if role == ROLE_SCHOOL_ADMIN:
+            school_id = get_user_school_id(user)
+            if not school_id:
+                return qs.none()
+            return qs.filter(created_by__profile__school_id=school_id)
+        if role == ROLE_TEACHER:
+            return qs.filter(created_by=user)
+        return qs.none()
 
     def _normalize_topic(self, raw: str) -> str:
         """Ensure topic is a short label, not a full prompt (e.g. from mis-sent request)."""
@@ -719,7 +952,8 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         option_display=option_display,
                         difficulty=q_data.get('difficulty', difficulty),
                         tags=q_data.get('tags', [topic]),
-                        marks=q_data.get('marks', 1.0)
+                        marks=q_data.get('marks', 1.0),
+                        created_by=request.user,
                     )
                     generated_questions.append(QuestionSerializer(question).data)
                 
@@ -945,20 +1179,21 @@ class ParticipantViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         exam_id = self.request.query_params.get('exam_id')
         user = self.request.user
-        # Order by clicker_id in natural order: 1, 2, ... 9, 10, 11, then alphanumeric (P007, S008, etc.)
         base_order = [Length('clicker_id'), 'clicker_id']
+        base_qs = scope_participants_queryset(Participant.objects.all(), user)
         if exam_id:
-            # Only return participants for exams owned by current user
+            exam_qs = scope_exams_queryset(Exam.objects.all(), user)
             try:
-                exam = Exam.objects.get(id=exam_id, created_by=user)
+                exam = exam_qs.get(id=exam_id)
             except Exam.DoesNotExist:
                 return Participant.objects.none()
             participant_ids = ExamParticipant.objects.filter(exam=exam).values_list('participant_id', flat=True)
-            return Participant.objects.filter(id__in=participant_ids).order_by(*base_order)
-        # No exam_id (e.g. /participants/ page): return all participants so the list
-        # shows every participant and which clicker_id is assigned (avoids "clicker id
-        # already assigned" when the assigning participant is not in the filtered list).
-        return Participant.objects.all().order_by(*base_order)
+            return base_qs.filter(id__in=participant_ids).order_by(*base_order)
+        return base_qs.order_by(*base_order)
+
+    def perform_create(self, serializer):
+        """Set created_by on single participant create."""
+        serializer.save(created_by=self.request.user)
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
@@ -977,11 +1212,14 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             extra = {k: (v if isinstance(v, str) else str(v)) for k, v in item.items()
                      if k not in RESERVED_KEYS and v is not None and str(v).strip() != ''}
             try:
+                school_id = get_user_school_id(request.user)
                 participant = Participant.objects.create(
                     name=name,
                     clicker_id=clicker_id,
                     email=email,
-                    extra=extra
+                    school_id=school_id,
+                    extra=extra,
+                    created_by=request.user,
                 )
                 created.append(ParticipantSerializer(participant).data)
             except Exception as e:
@@ -1028,6 +1266,12 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     'employee code': 'employee_code', 'employee code.': 'employee_code',
                     'teacher name': 'teacher_name', 'teacher': 'teacher_name', 'teaccher name': 'teacher_name',
                     'email id': 'email_id', 'email': 'email_id', 'e-mail': 'email_id', 'email address': 'email_id',
+                    'parent email id': 'parent_email_id', 'parent email': 'parent_email_id',
+                    'parent e-mail': 'parent_email_id', 'parent e mail': 'parent_email_id',
+                    'parent_email': 'parent_email_id', 'parent_email_id': 'parent_email_id',
+                    'parents email': 'parent_email_id', 'parents email id': 'parent_email_id',
+                    'father email': 'parent_email_id', 'mother email': 'parent_email_id',
+                    'guardian email': 'parent_email_id',
                 }
                 return COLUMN_TO_EXTRA_KEY.get(s) or s.replace(' ', '_').replace('.', '').replace('-', '_') or None
 
@@ -1083,14 +1327,15 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                             extra['email_id'] = extra.get('email_id') or email
                             email = None
                     
+                    school_id = get_user_school_id(request)
                     participant, created = Participant.objects.update_or_create(
                         clicker_id=clicker_id,
-                        defaults={'name': name, 'email': email, 'extra': extra}
+                        defaults={'name': name, 'email': email, 'school_id': school_id, 'extra': extra}
                     )
                     
                     if exam_id:
                         try:
-                            exam = Exam.objects.get(id=exam_id, created_by=request.user)
+                            exam = scope_exams_queryset(Exam.objects.all(), request.user).get(id=exam_id)
                             ExamParticipant.objects.get_or_create(exam=exam, participant=participant)
                         except Exam.DoesNotExist:
                             pass
@@ -1115,6 +1360,231 @@ class ParticipantViewSet(viewsets.ModelViewSet):
         participant.save()
         
         return Response(ParticipantSerializer(participant).data)
+
+
+# RBAC: Schools and user management
+class SchoolViewSet(viewsets.ModelViewSet):
+    """Schools: list/create for Super Admin; list own for School Admin."""
+    serializer_class = SchoolSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return scope_schools_queryset(School.objects.all(), self.request.user)
+
+    def perform_create(self, serializer):
+        if not can_create_school_admin(self.request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('Only Super Admin can create schools.')
+        serializer.save()
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_school_admin(request):
+    """Create a School Admin user. Super Admin only."""
+    if not can_create_school_admin(request.user):
+        return Response({'error': 'Only Super Admin can create School Admins.'}, status=status.HTTP_403_FORBIDDEN)
+    serializer = CreateSchoolAdminSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        user = serializer.save()
+        return Response({
+            'id': user.id,
+            'email': user.email,
+            'role': 'school_admin',
+            'school_id': user.profile.school_id,
+            'message': 'School Admin created.',
+        }, status=status.HTTP_201_CREATED)
+    except drf_serializers.ValidationError as e:
+        return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def manage_school_admin(request, user_id):
+    """Edit or delete a School Admin user. Super Admin only."""
+    from django.contrib.auth.models import User
+    if not can_create_school_admin(request.user):
+        return Response({'error': 'Only Super Admin can manage School Admins.'}, status=status.HTTP_403_FORBIDDEN)
+    try:
+        user = User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        profile = user.profile
+    except UserProfile.DoesNotExist:
+        return Response({'error': 'User has no profile.'}, status=status.HTTP_400_BAD_REQUEST)
+    if profile.role != ROLE_SCHOOL_ADMIN:
+        return Response({'error': 'User is not a School Admin.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if request.method == 'DELETE':
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # PATCH
+    data = request.data or {}
+    email = data.get('email')
+    name = data.get('name')
+    school_id = data.get('school_id')
+    password = data.get('password')
+    from django.contrib.auth.models import User as DjangoUser
+    from .models import School
+
+    if email:
+        email = email.strip()
+        if DjangoUser.objects.exclude(pk=user.pk).filter(email=email).exists():
+            return Response({'email': ['A user with this email already exists.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.email = email
+        user.username = email
+    if name is not None:
+        user.first_name = (name or '').strip()
+    user.save()
+
+    if school_id is not None:
+        try:
+            school_obj = School.objects.get(pk=school_id)
+        except School.DoesNotExist:
+            return Response({'school_id': ['School not found.']}, status=status.HTTP_400_BAD_REQUEST)
+        profile.school = school_obj
+        profile.save()
+
+    if password:
+        if len(password) < 8:
+            return Response({'password': ['Password must be at least 8 characters.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(password)
+        user.save()
+
+    return Response({
+        'id': user.id,
+        'email': user.email,
+        'name': (user.first_name or '').strip() or user.email,
+        'school_id': profile.school_id,
+        'school_name': profile.school.name if profile.school else '',
+    })
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_teacher(request):
+    """Create a Teacher user. Super Admin or School Admin (for their school)."""
+    if not can_create_teacher(request.user):
+        return Response({'error': 'Only Super Admin or School Admin can create Teachers.'}, status=status.HTTP_403_FORBIDDEN)
+    data = request.data.copy()
+    role = get_user_role(request.user)
+    if role == ROLE_SCHOOL_ADMIN:
+        data['school_id'] = get_user_school_id(request.user)
+    serializer = CreateTeacherSerializer(data=data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        user = serializer.save()
+        return Response({
+            'id': user.id,
+            'email': user.email,
+            'role': 'teacher',
+            'school_id': user.profile.school_id,
+            'message': 'Teacher created.',
+        }, status=status.HTTP_201_CREATED)
+    except drf_serializers.ValidationError as e:
+        return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def manage_teacher(request, user_id):
+    """Edit or delete a Teacher user. Super Admin or School Admin (their school)."""
+    from django.contrib.auth.models import User
+    role = get_user_role(request.user)
+    if role not in (ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN):
+        return Response({'error': 'Only Super Admin or School Admin can manage Teachers.'}, status=status.HTTP_403_FORBIDDEN)
+    try:
+        user = User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        profile = user.profile
+    except UserProfile.DoesNotExist:
+        return Response({'error': 'User has no profile.'}, status=status.HTTP_400_BAD_REQUEST)
+    if profile.role != ROLE_TEACHER:
+        return Response({'error': 'User is not a Teacher.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # School Admin can only manage teachers in their own school
+    if role == ROLE_SCHOOL_ADMIN:
+        admin_school_id = get_user_school_id(request.user)
+        if not admin_school_id or profile.school_id != admin_school_id:
+            return Response({'error': 'You can only manage teachers in your school.'}, status=status.HTTP_403_FORBIDDEN)
+
+    if request.method == 'DELETE':
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    data = request.data or {}
+    email = data.get('email')
+    name = data.get('name')
+    school_id = data.get('school_id')
+    password = data.get('password')
+    from django.contrib.auth.models import User as DjangoUser
+    from .models import School
+
+    if email:
+        email = email.strip()
+        if DjangoUser.objects.exclude(pk=user.pk).filter(email=email).exists():
+            return Response({'email': ['A user with this email already exists.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.email = email
+        user.username = email
+    if name is not None:
+        user.first_name = (name or '').strip()
+    user.save()
+
+    if school_id is not None:
+        try:
+            school_obj = School.objects.get(pk=school_id)
+        except School.DoesNotExist:
+            return Response({'school_id': ['School not found.']}, status=status.HTTP_400_BAD_REQUEST)
+        # For school_admin, ensure they are not moving teacher out of their school
+        if role == ROLE_SCHOOL_ADMIN and school_obj.id != admin_school_id:
+            return Response({'school_id': ['You can only assign teachers to your school.']}, status=status.HTTP_400_BAD_REQUEST)
+        profile.school = school_obj
+        profile.save()
+
+    if password:
+        if len(password) < 8:
+            return Response({'password': ['Password must be at least 8 characters.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(password)
+        user.save()
+
+    return Response({
+        'id': user.id,
+        'email': user.email,
+        'name': (user.first_name or '').strip() or user.email,
+        'school_id': profile.school_id,
+        'school_name': profile.school.name if profile.school else '',
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_exam_owners(request):
+    """List School Admins and Teachers for exam owner dropdown. Super Admin sees all; School Admin sees teachers in their school."""
+    from django.contrib.auth.models import User
+    role = get_user_role(request.user)
+    school_id = get_user_school_id(request.user)
+    if role == ROLE_TEACHER:
+        return Response([])
+    qs = UserProfile.objects.filter(role__in=[ROLE_SCHOOL_ADMIN, ROLE_TEACHER]).select_related('user', 'school')
+    if role == ROLE_SCHOOL_ADMIN and school_id is not None:
+        qs = qs.filter(school_id=school_id)
+    out = []
+    for p in qs.order_by('school__name', 'user__email'):
+        out.append({
+            'id': p.user_id,
+            'email': p.user.email or '',
+            'name': (p.user.first_name or '').strip() or p.user.email or str(p.user_id),
+            'role': p.role,
+            'school_id': p.school_id,
+            'school_name': p.school.name if p.school else '',
+        })
+    return Response(out)
 
 
 # Reports Views
@@ -1156,6 +1626,7 @@ PARTICIPANT_REPORT_FIELDS = [
     ('Employee Code', 'employee_code'),
     ('Teacher Name', 'teacher_name'),
     ('Email ID', 'email_id'),
+    ('Parent Email ID', 'parent_email_id'),
 ]
 
 
@@ -1213,6 +1684,7 @@ def _participant_report_row(participant):
         'employee_code': extra.get('employee_code', ''),
         'teacher_name': extra.get('teacher_name', ''),
         'email_id': email_id,
+        'parent_email_id': extra.get('parent_email_id', ''),
     }
     return row
 
@@ -1320,8 +1792,9 @@ def _get_exam_report_data(exam):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def exam_report(request, exam_id):
+    qs = scope_exams_queryset(Exam.objects.all(), request.user)
     try:
-        exam = Exam.objects.get(id=exam_id)
+        exam = qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
     report_data = _get_exam_report_data(exam)
@@ -1966,8 +2439,9 @@ def export_report_http(request, exam_id):
         user_auth = None
     if user_auth is None:
         return JsonResponse({'detail': 'Authentication credentials were not provided.'}, status=401)
+    exam_qs = scope_exams_queryset(Exam.objects.all(), request.user)
     try:
-        exam = Exam.objects.get(id=exam_id)
+        exam = exam_qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return JsonResponse(
             {'error': 'Exam not found', 'exam_id': exam_id, 'message': 'No exam with this id. Run: python manage.py seed_dummy_data'},
@@ -1984,14 +2458,15 @@ def export_report_http(request, exam_id):
 @permission_classes([IsAuthenticated])
 def dashboard(request):
     user = request.user
-    exams = Exam.objects.filter(created_by=user)
+    exams = scope_exams_queryset(Exam.objects.all(), user)
     
     # Stats
     total_exams = exams.count()
-    total_participants = Participant.objects.count()
+    participants_qs = scope_participants_queryset(Participant.objects.all(), user)
+    total_participants = participants_qs.count()
     
-    # Calculate average score from all attempts
-    all_attempts = ExamAttempt.objects.filter(exam__created_by=user).select_related('exam')
+    # Calculate average score from all attempts (only for user's visible exams)
+    all_attempts = ExamAttempt.objects.filter(exam__in=exams).select_related('exam')
     if all_attempts.exists():
         total_percentage = 0
         count = 0
@@ -2005,7 +2480,7 @@ def dashboard(request):
         avg_score = 0
     
     # Attendance rate (participants who attempted / total participants)
-    total_assigned = ExamParticipant.objects.filter(exam__created_by=user).count()
+    total_assigned = ExamParticipant.objects.filter(exam__in=exams).count()
     attempted = all_attempts.count()
     attendance_rate = (attempted / total_assigned * 100) if total_assigned > 0 else 0
     
@@ -2085,8 +2560,9 @@ def dashboard(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def leaderboard(request, exam_id):
+    qs = scope_exams_queryset(Exam.objects.all(), request.user)
     try:
-        exam = Exam.objects.get(id=exam_id)
+        exam = qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
     
@@ -2114,3 +2590,83 @@ def leaderboard(request, exam_id):
     
     serializer = LeaderboardSerializer(leaderboard_data)
     return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def export_leaderboard(request, exam_id):
+    """
+    GET /api/leaderboard/exams/{exam_id}/export/?format=excel|pdf
+    Downloads leaderboard report as Excel or PDF.
+    """
+    # DRF uses `?format=` for content negotiation; use `file_format` instead.
+    raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
+    format_type = 'pdf' if raw in ('pdf',) else 'excel'
+
+    qs = scope_exams_queryset(Exam.objects.all(), request.user)
+    try:
+        exam = qs.get(id=exam_id)
+    except Exam.DoesNotExist:
+        return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    attempts = ExamAttempt.objects.filter(exam=exam).order_by('-score', 'time_taken')
+    entries = []
+    for rank, attempt in enumerate(attempts, 1):
+        entries.append({
+            'Rank': rank,
+            'Participant ID': attempt.participant.id,
+            'Participant': attempt.participant.name,
+            'Score': float(attempt.score),
+            'Correct': attempt.correct_answers,
+            'Total Questions': attempt.total_questions,
+            'Percentage': float(attempt.percentage),
+            'Time Taken (sec)': attempt.time_taken,
+        })
+
+    filename_base = f'leaderboard-{exam.id}'
+    if format_type == 'excel':
+        output = BytesIO()
+        df = pd.DataFrame(entries, columns=[
+            'Rank', 'Participant ID', 'Participant', 'Score', 'Correct',
+            'Total Questions', 'Percentage', 'Time Taken (sec)'
+        ])
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Leaderboard', index=False)
+        output.seek(0)
+        response = HttpResponse(output.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        response['Content-Disposition'] = f'attachment; filename="{filename_base}.xlsx"'
+        return response
+
+    # PDF
+    output = BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=A4)
+    styles = getSampleStyleSheet()
+    elements = [
+        Paragraph(f'Leaderboard - {exam.title}', styles['Title']),
+        Spacer(1, 12),
+        Paragraph(f'Generated at: {timezone.now().strftime("%d/%m/%Y %H:%M")}', styles['Normal']),
+        Spacer(1, 12),
+    ]
+
+    table_data = [[
+        'Rank', 'Participant', 'Score', 'Correct', 'Total', 'Percentage', 'Time Taken (sec)'
+    ]] + [
+        [e['Rank'], e['Participant'], e['Score'], e['Correct'], e['Total Questions'], e['Percentage'], e['Time Taken (sec)']]
+        for e in entries
+    ]
+    table = Table(table_data, repeatRows=1, hAlign='LEFT')
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(table)
+    doc.build(elements)
+    output.seek(0)
+
+    response = HttpResponse(output.getvalue(), content_type='application/pdf')
+    response['Content-Disposition'] = f'attachment; filename="{filename_base}.pdf"'
+    return response
