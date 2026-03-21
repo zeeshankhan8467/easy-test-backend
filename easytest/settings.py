@@ -17,8 +17,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-this-in-production'
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-#ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,localhost:5174').split(',')
-ALLOWED_HOSTS = ['easytestlive.com','168.144.18.139', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,127.0.0.1:5174').split(',')
 
 # Application definition
 INSTALLED_APPS = [
@@ -35,18 +34,17 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    "corsheaders.middleware.CorsMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+CORS_ALLOW_ALL_ORIGINS = True
 
 ROOT_URLCONF = 'easytest.urls'
 
@@ -81,8 +79,8 @@ else:
         'default': {
             'ENGINE': 'django.db.backends.mysql',
             'NAME': os.getenv('DB_NAME', 'easytest'),
-            'USER': os.getenv('DB_USER', 'easytestuser'),
-            'PASSWORD': os.getenv('DB_PASSWORD', 'StrongPassword123'),
+            'USER': os.getenv('DB_USER', 'root'),
+            'PASSWORD': os.getenv('DB_PASSWORD', ''),
             'HOST': os.getenv('DB_HOST', '127.0.0.1'),
             'PORT': os.getenv('DB_PORT', '3306'),
             'OPTIONS': {
@@ -149,10 +147,8 @@ SIMPLE_JWT = {
 # CORS Settings - allow frontend dev servers (localhost and 127.0.0.1)
 _default_origins = [
     'http://localhost:5173',
-    'http://localhost:5174',
     'http://localhost:3000',
     'http://127.0.0.1:5173',
-    'http://127.0.0.1:5174',
     'http://127.0.0.1:3000',
 ]
 CORS_ALLOWED_ORIGINS = [
@@ -167,29 +163,3 @@ CORS_ALLOW_CREDENTIALS = True
 # Media files
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
-
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOW_CREDENTIALS = True
-
-# Email (used for parent notifications)
-# IMPORTANT: If SMTP envs are set, use SMTP even when DEBUG=True.
-# Only fall back to console backend when no EMAIL_HOST is configured.
-_email_backend_env = (os.getenv('EMAIL_BACKEND', '') or '').strip()
-_email_host = (os.getenv('EMAIL_HOST', '') or '').strip()
-
-EMAIL_BACKEND = (
-    _email_backend_env
-    if _email_backend_env
-    else (
-        'django.core.mail.backends.smtp.EmailBackend'
-        if _email_host
-        else 'django.core.mail.backends.console.EmailBackend'
-    )
-)
-
-EMAIL_HOST = _email_host
-EMAIL_PORT = int((os.getenv('EMAIL_PORT', '587') or '587').strip())
-EMAIL_HOST_USER = (os.getenv('EMAIL_HOST_USER', '') or '').strip()
-EMAIL_HOST_PASSWORD = (os.getenv('EMAIL_HOST_PASSWORD', '') or '').strip()
-EMAIL_USE_TLS = (os.getenv('EMAIL_USE_TLS', 'True') or 'True').strip() == 'True'
-DEFAULT_FROM_EMAIL = (os.getenv('DEFAULT_FROM_EMAIL', '') or '').strip() or (EMAIL_HOST_USER or 'no-reply@easytestlive.com')

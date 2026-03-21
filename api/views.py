@@ -375,6 +375,32 @@ class ExamViewSet(viewsets.ModelViewSet):
                 }
 
         # Resolve participant by id or clicker_id; create one from clicker_id if missing (e.g. deviceId fallback when SDK keySN is empty)
+        # clicker_id is unique per exam author (teacher), not globally — scope lookups to this exam / exam.created_by.
+        def _participant_by_clicker_for_exam(clicker_id_str):
+            if not clicker_id_str:
+                return None
+            p = (
+                Participant.objects.filter(
+                    clicker_id=clicker_id_str,
+                    participant_exams__exam=exam,
+                )
+                .first()
+            )
+            if p:
+                return p
+            if exam.created_by_id:
+                p = (
+                    Participant.objects.filter(
+                        clicker_id=clicker_id_str,
+                        created_by_id=exam.created_by_id,
+                    )
+                    .first()
+                )
+                if p:
+                    return p
+            # Legacy / edge case: fall back to global match (e.g. old rows without created_by)
+            return Participant.objects.filter(clicker_id=clicker_id_str).first()
+
         def get_or_create_participant_for_clicker(participant_id=None, clicker_id=None):
             if participant_id:
                 try:
@@ -387,31 +413,39 @@ class ExamViewSet(viewsets.ModelViewSet):
                 clicker_id_str = str(clicker_id).strip()
                 if not clicker_id_str:
                     return None
-                try:
-                    p = Participant.objects.get(clicker_id=clicker_id_str)
-                    if ExamParticipant.objects.filter(exam=exam, participant=p).exists():
-                        return p
+                p = _participant_by_clicker_for_exam(clicker_id_str)
+                if p:
                     ExamParticipant.objects.get_or_create(exam=exam, participant=p)
                     return p
-                except Participant.DoesNotExist:
-                    pass
                 # When app sends deviceId fallback (d1_timestamp) because SDK keySN is empty, match to participant with clicker_id = number (e.g. "1")
                 if clicker_id_str.startswith('d') and '_' in clicker_id_str:
                     num_part = clicker_id_str[1:].split('_')[0]
                     if num_part.isdigit():
-                        try:
-                            p = Participant.objects.get(clicker_id=num_part)
+                        p = _participant_by_clicker_for_exam(num_part)
+                        if p:
                             ExamParticipant.objects.get_or_create(exam=exam, participant=p)
                             return p
-                        except Participant.DoesNotExist:
-                            pass
                 # Auto-create participant only if no match (e.g. when SDK sends empty keySN and no participant has that clicker number)
                 safe_id = ''.join(c if c.isalnum() or c in '_-' else '_' for c in clicker_id_str)[:50]
-                email = f'clicker-{safe_id}@easytest.local'
-                p, created = Participant.objects.get_or_create(
-                    clicker_id=clicker_id_str,
-                    defaults={'name': 'Student', 'email': email}
-                )
+                uid = exam.created_by_id or 0
+                email = f'clicker-e{exam.id}-u{uid}-{safe_id}@easytest.local'
+                defaults = {
+                    'name': 'Student',
+                    'email': email,
+                }
+                if exam.school_id:
+                    defaults['school_id'] = exam.school_id
+                if exam.created_by_id:
+                    p, created = Participant.objects.get_or_create(
+                        clicker_id=clicker_id_str,
+                        created_by_id=exam.created_by_id,
+                        defaults=defaults,
+                    )
+                else:
+                    p, created = Participant.objects.get_or_create(
+                        clicker_id=clicker_id_str,
+                        defaults=defaults,
+                    )
                 if created:
                     logger.info('[sync_live_results] Auto-created participant id=%s clicker_id=%s for exam %s', p.id, clicker_id_str, pk)
                 ExamParticipant.objects.get_or_create(exam=exam, participant=p)
@@ -1192,8 +1226,9 @@ class ParticipantViewSet(viewsets.ModelViewSet):
         return base_qs.order_by(*base_order)
 
     def perform_create(self, serializer):
-        """Set created_by on single participant create."""
-        serializer.save(created_by=self.request.user)
+        """Set created_by and school on single participant create."""
+        school_id = get_user_school_id(self.request.user)
+        serializer.save(created_by=self.request.user, school_id=school_id)
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
@@ -1330,7 +1365,8 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     school_id = get_user_school_id(request)
                     participant, created = Participant.objects.update_or_create(
                         clicker_id=clicker_id,
-                        defaults={'name': name, 'email': email, 'school_id': school_id, 'extra': extra}
+                        created_by=request.user,
+                        defaults={'name': name, 'email': email, 'school_id': school_id, 'extra': extra},
                     )
                     
                     if exam_id:
@@ -1356,10 +1392,15 @@ class ParticipantViewSet(viewsets.ModelViewSet):
         if not clicker_id:
             return Response({'error': 'clicker_id required'}, status=status.HTTP_400_BAD_REQUEST)
         
-        participant.clicker_id = clicker_id
-        participant.save()
-        
-        return Response(ParticipantSerializer(participant).data)
+        serializer = ParticipantSerializer(
+            participant,
+            data={'clicker_id': str(clicker_id).strip()},
+            partial=True,
+            context={'request': request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
 
 # RBAC: Schools and user management

@@ -348,11 +348,24 @@ class ParticipantSerializer(serializers.ModelSerializer):
         value = (value or '').strip()
         if not value:
             raise serializers.ValidationError('Clicker ID is required.')
+        # Uniqueness is per teacher (created_by), not global — matches scoped participant list API.
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request else None
+        if self.instance is not None:
+            owner_id = self.instance.created_by_id
+        else:
+            owner_id = user.id if user and getattr(user, 'is_authenticated', False) else None
         qs = Participant.objects.filter(clicker_id=value)
+        if owner_id is not None:
+            qs = qs.filter(created_by_id=owner_id)
+        else:
+            qs = qs.filter(created_by__isnull=True)
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
-            raise serializers.ValidationError('Clicker ID already assigned.')
+            raise serializers.ValidationError(
+                'This clicker ID is already used by another participant in your roster.'
+            )
         return value
 
     def validate_name(self, value):
