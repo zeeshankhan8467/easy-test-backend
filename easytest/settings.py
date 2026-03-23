@@ -163,3 +163,32 @@ CORS_ALLOW_CREDENTIALS = True
 # Media files
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Email (SMTP)
+# If EMAIL_HOST is configured, we use SMTP even when DEBUG=True.
+_email_host_default = 'smtp.gmail.com'
+_email_port_default = '587'
+_email_use_tls_default = 'True'
+_email_host_user_default = 'easytest1988@gmail.com'
+# Gmail app passwords are sometimes pasted/shown as groups with spaces.
+# Store the default without whitespace, and also strip whitespace if loaded from env.
+_email_host_password_default = 'rxrdoenzbflnsnrb'
+_default_from_email_default = 'yourgmail@gmail.com'
+
+_email_host = (os.getenv('EMAIL_HOST', _email_host_default) or '').strip()
+_email_port = (os.getenv('EMAIL_PORT', _email_port_default) or '').strip()
+_email_host_user = (os.getenv('EMAIL_HOST_USER', _email_host_user_default) or '').strip()
+_email_host_password = (os.getenv('EMAIL_HOST_PASSWORD', _email_host_password_default) or '').strip()
+
+# Remove all whitespace so SMTP receives the correct raw password.
+_email_host_password = ''.join(_email_host_password.split())
+
+EMAIL_HOST = _email_host
+EMAIL_PORT = int(_email_port) if _email_port.isdigit() else 587
+EMAIL_HOST_USER = _email_host_user
+EMAIL_HOST_PASSWORD = _email_host_password
+EMAIL_USE_TLS = (os.getenv('EMAIL_USE_TLS', _email_use_tls_default) or '').strip().lower() in ('1', 'true', 'yes', 'on')
+DEFAULT_FROM_EMAIL = (os.getenv('DEFAULT_FROM_EMAIL', _default_from_email_default) or '').strip()
+
+# Always use SMTP so the "send email to parent" feature works in dev.
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
