@@ -17,7 +17,7 @@ from django.db.models.functions import Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_GET
-from django.core.mail import EmailMessage
+from django.core.mail import EmailMessage, get_connection
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from datetime import timedelta
 import pandas as pd
@@ -781,43 +781,58 @@ class ExamViewSet(viewsets.ModelViewSet):
         skipped = 0
         errors = []
 
+        # Reuse a single SMTP connection for all recipients.
+        # This avoids long repeated reconnects and helps prevent gunicorn worker timeouts.
+        connection = get_connection(fail_silently=False)
+        try:
+            connection.open()
+        except Exception as e:
+            return Response({'sent': 0, 'skipped': 0, 'errors': [str(e)]}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
         def _render(template: str, ctx: dict) -> str:
             out = template
             for k, v in ctx.items():
                 out = out.replace('{{' + k + '}}', str(v))
             return out
 
-        for ep in assigned:
-            p = ep.participant
-            is_present = p.id in present_ids
-            if scope == 'present' and not is_present:
-                continue
-            if scope == 'absent' and is_present:
-                continue
+        try:
+            for ep in assigned:
+                p = ep.participant
+                is_present = p.id in present_ids
+                if scope == 'present' and not is_present:
+                    continue
+                if scope == 'absent' and is_present:
+                    continue
 
-            extra = p.extra or {}
-            parent_email = extra.get('parent_email_id') if isinstance(extra, dict) else None
-            parent_email = (parent_email or '').strip()
-            if not parent_email:
-                skipped += 1
-                continue
+                extra = p.extra or {}
+                parent_email = extra.get('parent_email_id') if isinstance(extra, dict) else None
+                parent_email = (parent_email or '').strip()
+                if not parent_email:
+                    skipped += 1
+                    continue
 
-            ctx = {
-                'exam_title': exam.title,
-                'student_name': p.name,
-                'clicker_id': p.clicker_id,
-                'status': 'Present' if is_present else 'Absent',
-            }
-            msg = EmailMessage(
-                subject=_render(subject, ctx),
-                body=_render(body, ctx),
-                to=[parent_email],
-            )
+                ctx = {
+                    'exam_title': exam.title,
+                    'student_name': p.name,
+                    'clicker_id': p.clicker_id,
+                    'status': 'Present' if is_present else 'Absent',
+                }
+                msg = EmailMessage(
+                    subject=_render(subject, ctx),
+                    body=_render(body, ctx),
+                    to=[parent_email],
+                    connection=connection,
+                )
+                try:
+                    msg.send(fail_silently=False)
+                    sent += 1
+                except Exception as e:
+                    errors.append(f'Participant {p.id}: {str(e)}')
+        finally:
             try:
-                msg.send(fail_silently=False)
-                sent += 1
-            except Exception as e:
-                errors.append(f'Participant {p.id}: {str(e)}')
+                connection.close()
+            except Exception:
+                pass
 
         return Response({'sent': sent, 'skipped': skipped, 'errors': errors})
 

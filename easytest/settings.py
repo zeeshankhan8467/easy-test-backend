@@ -190,5 +190,8 @@ EMAIL_HOST_PASSWORD = _email_host_password
 EMAIL_USE_TLS = (os.getenv('EMAIL_USE_TLS', _email_use_tls_default) or '').strip().lower() in ('1', 'true', 'yes', 'on')
 DEFAULT_FROM_EMAIL = (os.getenv('DEFAULT_FROM_EMAIL', _default_from_email_default) or '').strip()
 
+# SMTP connect timeout (seconds). Keeps gunicorn workers from hanging on network blocks.
+EMAIL_TIMEOUT = int((os.getenv('EMAIL_TIMEOUT', '10') or '').strip() or '10')
+
 # Always use SMTP so the "send email to parent" feature works in dev.
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
