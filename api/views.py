@@ -2480,6 +2480,11 @@ def export_report_http(request, exam_id):
         user_auth = None
     if user_auth is None:
         return JsonResponse({'detail': 'Authentication credentials were not provided.'}, status=401)
+    # JWTAuthentication.authenticate() returns a (user, token) tuple, but
+    # since this is a plain Django view we must attach it to request manually.
+    user, token = user_auth
+    request.user = user
+    request.auth = token
     exam_qs = scope_exams_queryset(Exam.objects.all(), request.user)
     try:
         exam = exam_qs.get(id=exam_id)
