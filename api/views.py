@@ -1362,7 +1362,7 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                             extra['email_id'] = extra.get('email_id') or email
                             email = None
                     
-                    school_id = get_user_school_id(request)
+                    school_id = get_user_school_id(request.user)
                     participant, created = Participant.objects.update_or_create(
                         clicker_id=clicker_id,
                         created_by=request.user,
