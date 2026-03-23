@@ -787,7 +787,9 @@ class ExamViewSet(viewsets.ModelViewSet):
         try:
             connection.open()
         except Exception as e:
-            return Response({'sent': 0, 'skipped': 0, 'errors': [str(e)]}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            # Network/SMTP connectivity failure (e.g., no internet, firewall blocking).
+            # Return a normal JSON response so the UI can show the exact error.
+            return Response({'sent': 0, 'skipped': 0, 'errors': [str(e)]}, status=status.HTTP_200_OK)
 
         def _render(template: str, ctx: dict) -> str:
             out = template
