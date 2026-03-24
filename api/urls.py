@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     login, ExamViewSet, QuestionViewSet, ParticipantViewSet, SchoolViewSet,
     exam_report, export_report, dashboard, leaderboard, export_leaderboard,
+    student_performance_report, student_performance_report_export,
     create_school_admin, create_teacher, list_exam_owners, manage_school_admin, manage_teacher,
 )
 
@@ -20,6 +21,8 @@ urlpatterns = [
     path('auth/teachers/<int:user_id>/', manage_teacher, name='manage-teacher'),
     path('users/exam-owners/', list_exam_owners, name='list-exam-owners'),
     path('dashboard/', dashboard, name='dashboard'),
+    path('reports/student-performance/', student_performance_report, name='student-performance-report'),
+    path('reports/student-performance/export/', student_performance_report_export, name='student-performance-report-export'),
     path('reports/exams/<int:exam_id>/', exam_report, name='exam-report'),
     path('reports/exams/<int:exam_id>/export/', export_report, name='export-report'),
     path('leaderboard/exams/<int:exam_id>/', leaderboard, name='leaderboard'),

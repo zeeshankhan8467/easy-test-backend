@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import html as html_module
+from urllib.parse import quote
 from io import BytesIO
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
@@ -660,6 +661,12 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'email': p.email,
                 'clicker_id': p.clicker_id,
                 'parent_email_id': extra.get('parent_email_id', '') if isinstance(extra, dict) else '',
+                'parent_whatsapp': (
+                    extra.get('parent_whatsapp')
+                    or extra.get('parent_phone')
+                    or extra.get('parent_mobile')
+                    or ''
+                ) if isinstance(extra, dict) else '',
                 'present': p.id in present_ids,
             })
         present_count = len(present_ids)
@@ -697,13 +704,19 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'Keypad ID': p.clicker_id,
                 'Email': p.email or '',
                 'Parent Email ID': extra.get('parent_email_id', '') if isinstance(extra, dict) else '',
+                'Parent WhatsApp': (
+                    extra.get('parent_whatsapp')
+                    or extra.get('parent_phone')
+                    or extra.get('parent_mobile')
+                    or ''
+                ) if isinstance(extra, dict) else '',
                 'Status': status_label,
             })
 
         filename_base = f'attendance-{exam.id}'
         if format_type == 'excel':
             output = BytesIO()
-            df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Status'])
+            df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status'])
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Attendance', index=False)
             output.seek(0)
@@ -722,8 +735,8 @@ class ExamViewSet(viewsets.ModelViewSet):
             Spacer(1, 12),
         ]
 
-        table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Status']] + [
-            [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Status']] for r in rows
+        table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status']] + [
+            [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Parent WhatsApp'], r['Status']] for r in rows
         ]
         table = Table(table_data, repeatRows=1, hAlign='LEFT')
         table.setStyle(TableStyle([
@@ -837,6 +850,95 @@ class ExamViewSet(viewsets.ModelViewSet):
                 pass
 
         return Response({'sent': sent, 'skipped': skipped, 'errors': errors})
+
+    @action(detail=True, methods=['post'], url_path='attendance/send-parent-whatsapp')
+    def send_parent_whatsapp(self, request, pk=None):
+        """
+        POST /api/exams/{id}/attendance/send-parent-whatsapp/
+        Body:
+          {
+            "scope": "present" | "absent" | "all",
+            "message": ".... {{exam_title}} {{student_name}} {{clicker_id}} {{status}} ...",
+            "participant_ids": [1, 2, 3]  // optional
+          }
+        Returns generated WhatsApp links (wa.me) for selected participants.
+        """
+        exam = self.get_object()
+        scope = (request.data.get('scope') or 'absent').strip().lower()
+        participant_ids = request.data.get('participant_ids', None)
+        message = (request.data.get('message') or '').strip()
+        if scope not in ('present', 'absent', 'all'):
+            return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+        if participant_ids is not None and not isinstance(participant_ids, list):
+            return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+        if not message:
+            return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
+        if participant_ids:
+            try:
+                ids = [int(x) for x in participant_ids]
+            except Exception:
+                return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+            assigned = assigned.filter(participant_id__in=ids)
+        present_ids = set(ExamAttempt.objects.filter(exam=exam).values_list('participant_id', flat=True))
+
+        sent = 0
+        skipped = 0
+        errors = []
+        links = []
+
+        def _render(template: str, ctx: dict) -> str:
+            out = template
+            for k, v in ctx.items():
+                out = out.replace('{{' + k + '}}', str(v))
+            return out
+
+        def _normalize_phone(raw: str) -> str:
+            # WhatsApp wa.me expects digits only (country code included).
+            return ''.join(ch for ch in str(raw or '') if ch.isdigit())
+
+        for ep in assigned:
+            p = ep.participant
+            is_present = p.id in present_ids
+            if scope == 'present' and not is_present:
+                continue
+            if scope == 'absent' and is_present:
+                continue
+
+            extra = p.extra or {}
+            parent_phone = None
+            if isinstance(extra, dict):
+                parent_phone = (
+                    extra.get('parent_whatsapp')
+                    or extra.get('parent_phone')
+                    or extra.get('parent_mobile')
+                )
+            phone = _normalize_phone(parent_phone)
+            if not phone:
+                skipped += 1
+                continue
+
+            ctx = {
+                'exam_title': exam.title,
+                'student_name': p.name,
+                'clicker_id': p.clicker_id,
+                'status': 'Present' if is_present else 'Absent',
+            }
+            try:
+                text = _render(message, ctx)
+                wa_link = f'https://wa.me/{phone}?text={quote(text)}'
+                links.append({
+                    'participant_id': p.id,
+                    'student_name': p.name,
+                    'phone': phone,
+                    'link': wa_link,
+                })
+                sent += 1
+            except Exception as e:
+                errors.append(f'Participant {p.id}: {str(e)}')
+
+        return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'links': links})
 
 
 # Question Views
@@ -1324,6 +1426,16 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     'parents email': 'parent_email_id', 'parents email id': 'parent_email_id',
                     'father email': 'parent_email_id', 'mother email': 'parent_email_id',
                     'guardian email': 'parent_email_id',
+                    'parent whatsapp': 'parent_whatsapp',
+                    'parent whatsapp number': 'parent_whatsapp',
+                    'parent whatsapp no': 'parent_whatsapp',
+                    'parent phone': 'parent_whatsapp',
+                    'parent mobile': 'parent_whatsapp',
+                    'parent mobile number': 'parent_whatsapp',
+                    'guardian phone': 'parent_whatsapp',
+                    'guardian mobile': 'parent_whatsapp',
+                    'whatsapp': 'parent_whatsapp',
+                    'whatsapp number': 'parent_whatsapp',
                 }
                 return COLUMN_TO_EXTRA_KEY.get(s) or s.replace(' ', '_').replace('.', '').replace('-', '_') or None
 
@@ -1685,6 +1797,7 @@ PARTICIPANT_REPORT_FIELDS = [
     ('Teacher Name', 'teacher_name'),
     ('Email ID', 'email_id'),
     ('Parent Email ID', 'parent_email_id'),
+    ('Parent WhatsApp', 'parent_whatsapp'),
 ]
 
 
@@ -1743,6 +1856,12 @@ def _participant_report_row(participant):
         'teacher_name': extra.get('teacher_name', ''),
         'email_id': email_id,
         'parent_email_id': extra.get('parent_email_id', ''),
+        'parent_whatsapp': (
+            extra.get('parent_whatsapp')
+            or extra.get('parent_phone')
+            or extra.get('parent_mobile')
+            or ''
+        ),
     }
     return row
 
@@ -2617,6 +2736,146 @@ def dashboard(request):
     
     serializer = DashboardDataSerializer(dashboard_data)
     return Response(serializer.data)
+
+
+def _build_student_performance_rows(user, query_params):
+    """Build role-scoped student performance rows from query params."""
+    # Role-wise scoping
+    participants_qs = scope_participants_queryset(Participant.objects.all(), user)
+    exams_qs = scope_exams_queryset(Exam.objects.all(), user)
+
+    admission_no = (query_params.get('admission_no') or '').strip().lower()
+    roll_no = (query_params.get('roll_no') or '').strip().lower()
+    student_name = (query_params.get('student_name') or '').strip().lower()
+    class_name = (query_params.get('class_name') or '').strip().lower()
+    section = (query_params.get('section') or '').strip().lower()
+    teacher_name = (query_params.get('teacher_name') or '').strip().lower()
+    subject = (query_params.get('subject') or '').strip().lower()
+    from_date = (query_params.get('from_date') or '').strip()
+    to_date = (query_params.get('to_date') or '').strip()
+
+    attempts_qs = ExamAttempt.objects.filter(
+        exam__in=exams_qs,
+        participant__in=participants_qs,
+    ).select_related('participant', 'exam')
+
+    if from_date:
+        attempts_qs = attempts_qs.filter(submitted_at__date__gte=from_date)
+    if to_date:
+        attempts_qs = attempts_qs.filter(submitted_at__date__lte=to_date)
+
+    rows_by_participant = {}
+    for attempt in attempts_qs:
+        p = attempt.participant
+        if not p:
+            continue
+        extra = p.extra or {}
+        name_val = (p.name or '').strip()
+        row = rows_by_participant.get(p.id)
+        if row is None:
+            row = {
+                'participant_id': p.id,
+                'admission_no': (extra.get('admission_no') or '').strip() if isinstance(extra, dict) else '',
+                'roll_no': (extra.get('roll_no') or '').strip() if isinstance(extra, dict) else '',
+                'student_name': name_val,
+                'class_name': (extra.get('class') or '').strip() if isinstance(extra, dict) else '',
+                'section': (extra.get('section') or '').strip() if isinstance(extra, dict) else '',
+                'teacher_name': (extra.get('teacher_name') or '').strip() if isinstance(extra, dict) else '',
+                'subject': (extra.get('subject') or '').strip() if isinstance(extra, dict) else '',
+                '_attempts': 0,
+                '_pct_sum': 0.0,
+            }
+            rows_by_participant[p.id] = row
+
+        pct = 0.0
+        if attempt.total_questions and float(getattr(attempt.exam, 'positive_marking', 1) or 1) > 0:
+            pct = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
+        row['_attempts'] += 1
+        row['_pct_sum'] += pct
+
+    rows = []
+    for row in rows_by_participant.values():
+        # Apply text filters on flattened row values
+        if admission_no and admission_no not in (row['admission_no'] or '').lower():
+            continue
+        if roll_no and roll_no not in (row['roll_no'] or '').lower():
+            continue
+        if student_name and student_name not in (row['student_name'] or '').lower():
+            continue
+        if class_name and class_name not in (row['class_name'] or '').lower():
+            continue
+        if section and section not in (row['section'] or '').lower():
+            continue
+        if teacher_name and teacher_name not in (row['teacher_name'] or '').lower():
+            continue
+        if subject and subject not in (row['subject'] or '').lower():
+            continue
+
+        attempts_count = row.pop('_attempts', 0) or 0
+        pct_sum = row.pop('_pct_sum', 0.0) or 0.0
+        row['total_percentage'] = round((pct_sum / attempts_count), 2) if attempts_count > 0 else 0.0
+        rows.append(row)
+
+    rows.sort(key=lambda x: (-float(x.get('total_percentage') or 0), (x.get('student_name') or '').lower()))
+    return rows
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def student_performance_report(request):
+    """
+    GET /api/reports/student-performance/
+    Role-scoped student performance rows with optional filters:
+      admission_no, roll_no, student_name, class_name, section, teacher_name, subject,
+      from_date (YYYY-MM-DD), to_date (YYYY-MM-DD)
+    """
+    rows = _build_student_performance_rows(request.user, request.query_params)
+    return Response({'count': len(rows), 'results': rows})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def student_performance_report_export(request):
+    """
+    GET /api/reports/student-performance/export/?file_format=excel|csv&...
+    Exports student performance report with current filters.
+    """
+    rows = _build_student_performance_rows(request.user, request.query_params)
+    # DRF reserves `format` for content negotiation in some setups; prefer `file_format`.
+    raw = (request.query_params.get('file_format') or request.query_params.get('format') or 'excel').strip().lower()
+    format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
+
+    columns = [
+        'admission_no', 'roll_no', 'student_name', 'class_name',
+        'section', 'teacher_name', 'subject', 'total_percentage'
+    ]
+    df = pd.DataFrame(rows, columns=columns)
+    df = df.rename(columns={
+        'admission_no': 'Admission No',
+        'roll_no': 'Roll No',
+        'student_name': 'Student Name',
+        'class_name': 'Class',
+        'section': 'Section',
+        'teacher_name': 'Teacher Name',
+        'subject': 'Subject',
+        'total_percentage': 'Total Percentage %',
+    })
+
+    output = BytesIO()
+    if format_type == 'excel':
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Student Performance', index=False)
+        content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        filename = 'student-performance-report.xlsx'
+    else:
+        df.to_csv(output, index=False)
+        content_type = 'text/csv'
+        filename = 'student-performance-report.csv'
+
+    output.seek(0)
+    response = HttpResponse(output.getvalue(), content_type=content_type)
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
 
 
 # Leaderboard Views
