@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 from .models import (
     Exam, Question, ExamQuestion, Participant,
     ExamParticipant, ExamAttempt, Answer, School, UserProfile,
+    DailyAttendance,
     ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN, ROLE_TEACHER,
 )
 from .permissions import (
@@ -941,6 +942,466 @@ class ExamViewSet(viewsets.ModelViewSet):
         return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'links': links})
 
 
+def _parse_iso_date(date_str):
+    if not date_str or not isinstance(date_str, str):
+        return None
+    try:
+        from datetime import datetime
+        return datetime.strptime(date_str.strip(), '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+
+def _daily_att_extra_row(p):
+    extra = p.extra or {}
+    if not isinstance(extra, dict):
+        extra = {}
+    return {
+        'parent_email_id': extra.get('parent_email_id', '') or '',
+        'parent_whatsapp': (
+            extra.get('parent_whatsapp')
+            or extra.get('parent_phone')
+            or extra.get('parent_mobile')
+            or ''
+        ),
+    }
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_summary(request):
+    """List day-wise attendance stats for the last N calendar days (sidebar)."""
+    from datetime import timedelta
+    from collections import defaultdict
+
+    try:
+        days = int(request.query_params.get('days') or 60)
+    except (TypeError, ValueError):
+        days = 60
+    days = max(1, min(days, 400))
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    total = pqs.count()
+    pid_list = list(pqs.values_list('id', flat=True))
+    today = timezone.localdate()
+    start = today - timedelta(days=days - 1)
+
+    counts_by_date = defaultdict(lambda: {'present': 0, 'absent': 0})
+    if pid_list:
+        for row in DailyAttendance.objects.filter(
+            participant_id__in=pid_list, date__gte=start, date__lte=today
+        ).values('date', 'present'):
+            d = row['date']
+            if row['present']:
+                counts_by_date[d]['present'] += 1
+            else:
+                counts_by_date[d]['absent'] += 1
+
+    out = []
+    for i in range(days):
+        d = today - timedelta(days=i)
+        c = counts_by_date[d]
+        pr, ab = c['present'], c['absent']
+        marked = pr + ab
+        out.append({
+            'date': d.isoformat(),
+            'present_count': pr,
+            'absent_count': ab,
+            'unmarked_count': max(0, total - marked),
+            'total_count': total,
+        })
+    return Response(out)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_day(request):
+    """Roster for one day: all scoped participants with daily mark (if any)."""
+    d = _parse_iso_date(request.query_params.get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    pids = list(pqs.values_list('id', flat=True))
+    records = {}
+    if pids:
+        records = {
+            r.participant_id: r
+            for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids)
+        }
+
+    participants = []
+    present_n = absent_n = unmarked_n = 0
+    for p in pqs:
+        rec = records.get(p.id)
+        marked = rec is not None
+        present = bool(rec.present) if rec else False
+        if not marked:
+            unmarked_n += 1
+        elif present:
+            present_n += 1
+        else:
+            absent_n += 1
+        ex = _daily_att_extra_row(p)
+        participants.append({
+            'id': p.id,
+            'name': p.name,
+            'email': p.email or '',
+            'clicker_id': p.clicker_id,
+            'parent_email_id': ex['parent_email_id'],
+            'parent_whatsapp': ex['parent_whatsapp'],
+            'present': present,
+            'marked': marked,
+        })
+
+    return Response({
+        'date': d.isoformat(),
+        'participants': participants,
+        'present_count': present_n,
+        'absent_count': absent_n,
+        'unmarked_count': unmarked_n,
+        'total_count': len(participants),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_save(request):
+    """Save attendance for a day.
+
+    Body: { \"date\": \"YYYY-MM-DD\", \"entries\": [{\"participant_id\": 1, \"status\": \"present\"|\"absent\"|\"unmarked\"}, ...] }
+    Legacy: { \"participant_id\", \"present\": true/false } treats false as absent and true as present.
+    """
+    d = _parse_iso_date((request.data or {}).get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+    entries = (request.data or {}).get('entries')
+    if not isinstance(entries, list) or not entries:
+        return Response({'error': 'entries must be a non-empty list.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    allowed_ids = set(
+        scope_participants_queryset(Participant.objects.all(), user).values_list('id', flat=True)
+    )
+    saved = 0
+    errors = []
+    for item in entries:
+        if not isinstance(item, dict):
+            errors.append('Invalid entry')
+            continue
+        try:
+            pid = int(item.get('participant_id'))
+        except (TypeError, ValueError):
+            errors.append('Invalid participant_id')
+            continue
+        if pid not in allowed_ids:
+            errors.append(f'Participant {pid} not in scope')
+            continue
+
+        status_val = item.get('status')
+        if status_val is None and 'present' in item:
+            status_val = 'present' if bool(item.get('present')) else 'absent'
+        status_val = (str(status_val or '')).strip().lower()
+        if status_val == 'unmarked':
+            DailyAttendance.objects.filter(participant_id=pid, date=d).delete()
+            saved += 1
+            continue
+        if status_val in ('present', 'absent'):
+            DailyAttendance.objects.update_or_create(
+                participant_id=pid,
+                date=d,
+                defaults={'present': status_val == 'present', 'recorded_by': user},
+            )
+            saved += 1
+        else:
+            errors.append(f'Participant {pid}: invalid status')
+    return Response({'saved': saved, 'errors': errors})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_export(request):
+    """GET /api/attendance/day/export/?date=YYYY-MM-DD&file_format=excel|pdf"""
+    d = _parse_iso_date(request.query_params.get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    pids = list(pqs.values_list('id', flat=True))
+    records = {}
+    if pids:
+        records = {
+            r.participant_id: r
+            for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids)
+        }
+
+    rows = []
+    for p in pqs:
+        rec = records.get(p.id)
+        ex = _daily_att_extra_row(p)
+        if rec is None:
+            status_label = 'Not recorded'
+        else:
+            status_label = 'Present' if rec.present else 'Absent'
+        rows.append({
+            'Name': p.name,
+            'Keypad ID': p.clicker_id,
+            'Email': p.email or '',
+            'Parent Email ID': ex['parent_email_id'],
+            'Parent WhatsApp': ex['parent_whatsapp'],
+            'Status': status_label,
+        })
+
+    raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
+    format_type = 'pdf' if raw in ('pdf',) else 'excel'
+    filename_base = f'attendance-daily-{d.isoformat()}'
+
+    if format_type == 'excel':
+        output = BytesIO()
+        df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status'])
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Attendance', index=False)
+        output.seek(0)
+        response = HttpResponse(
+            output.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename_base}.xlsx"'
+        return response
+
+    output = BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=A4)
+    styles = getSampleStyleSheet()
+    title = f'Daily Attendance — {d.strftime("%d/%m/%Y")}'
+    elements = [
+        Paragraph(title, styles['Title']),
+        Spacer(1, 12),
+        Paragraph(f'Generated at: {timezone.now().strftime("%d/%m/%Y %H:%M")}', styles['Normal']),
+        Spacer(1, 12),
+    ]
+    table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status']] + [
+        [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Parent WhatsApp'], r['Status']] for r in rows
+    ]
+    table = Table(table_data, repeatRows=1, hAlign='LEFT')
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(table)
+    doc.build(elements)
+    output.seek(0)
+    response = HttpResponse(output.getvalue(), content_type='application/pdf')
+    response['Content-Disposition'] = f'attachment; filename="{filename_base}.pdf"'
+    return response
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_send_parent_emails(request):
+    """Same body as exam attendance emails; uses daily marks for `date`."""
+    d = _parse_iso_date((request.data or {}).get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    scope = ((request.data or {}).get('scope') or 'absent').strip().lower()
+    participant_ids = (request.data or {}).get('participant_ids', None)
+    subject = ((request.data or {}).get('subject') or '').strip()
+    body = ((request.data or {}).get('body') or '').strip()
+    if scope not in ('present', 'absent', 'all', 'unmarked'):
+        return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+    if participant_ids is not None and not isinstance(participant_ids, list):
+        return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+    if not subject:
+        return Response({'error': 'Subject is required'}, status=status.HTTP_400_BAD_REQUEST)
+    if not body:
+        return Response({'error': 'Body is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    if participant_ids:
+        try:
+            ids = [int(x) for x in participant_ids]
+        except Exception:
+            return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+        pqs = pqs.filter(id__in=ids)
+
+    pids = list(pqs.values_list('id', flat=True))
+    present_ids = set()
+    marked_ids = set()
+    if pids:
+        for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids).values(
+            'participant_id', 'present'
+        ):
+            marked_ids.add(r['participant_id'])
+            if r['present']:
+                present_ids.add(r['participant_id'])
+
+    attendance_date_label = d.strftime('%d/%m/%Y')
+    sent = 0
+    skipped = 0
+    errors = []
+    connection = get_connection(fail_silently=False)
+    try:
+        connection.open()
+    except Exception as e:
+        return Response({'sent': 0, 'skipped': 0, 'errors': [str(e)]}, status=status.HTTP_200_OK)
+
+    def _render(template: str, ctx: dict) -> str:
+        out = template
+        for k, v in ctx.items():
+            out = out.replace('{{' + k + '}}', str(v))
+        return out
+
+    try:
+        for p in pqs:
+            is_marked = p.id in marked_ids
+            is_present = p.id in present_ids
+            if scope == 'unmarked' and is_marked:
+                continue
+            if scope == 'present' and (not is_marked or not is_present):
+                continue
+            if scope == 'absent' and (not is_marked or is_present):
+                continue
+
+            extra = _daily_att_extra_row(p)
+            parent_email = (extra.get('parent_email_id') or '').strip()
+            if not parent_email:
+                skipped += 1
+                continue
+            status_human = 'Present' if is_present else ('Absent' if is_marked else 'Not recorded')
+            ctx = {
+                'exam_title': '',
+                'attendance_date': attendance_date_label,
+                'student_name': p.name,
+                'clicker_id': p.clicker_id,
+                'status': status_human,
+            }
+            msg = EmailMessage(
+                subject=_render(subject, ctx),
+                body=_render(body, ctx),
+                to=[parent_email],
+                connection=connection,
+            )
+            try:
+                msg.send(fail_silently=False)
+                sent += 1
+            except Exception as e:
+                errors.append(f'Participant {p.id}: {str(e)}')
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+    return Response({'sent': sent, 'skipped': skipped, 'errors': errors})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_send_parent_whatsapp(request):
+    d = _parse_iso_date((request.data or {}).get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    scope = ((request.data or {}).get('scope') or 'absent').strip().lower()
+    participant_ids = (request.data or {}).get('participant_ids', None)
+    message = ((request.data or {}).get('message') or '').strip()
+    if scope not in ('present', 'absent', 'all', 'unmarked'):
+        return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+    if participant_ids is not None and not isinstance(participant_ids, list):
+        return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+    if not message:
+        return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    if participant_ids:
+        try:
+            ids = [int(x) for x in participant_ids]
+        except Exception:
+            return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+        pqs = pqs.filter(id__in=ids)
+
+    pids = list(pqs.values_list('id', flat=True))
+    present_ids = set()
+    marked_ids = set()
+    if pids:
+        for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids).values('participant_id', 'present'):
+            marked_ids.add(r['participant_id'])
+            if r['present']:
+                present_ids.add(r['participant_id'])
+
+    attendance_date_label = d.strftime('%d/%m/%Y')
+    sent = 0
+    skipped = 0
+    errors = []
+    links = []
+
+    def _render(template: str, ctx: dict) -> str:
+        out = template
+        for k, v in ctx.items():
+            out = out.replace('{{' + k + '}}', str(v))
+        return out
+
+    def _normalize_phone(raw: str) -> str:
+        return ''.join(ch for ch in str(raw or '') if ch.isdigit())
+
+    for p in pqs:
+        is_marked = p.id in marked_ids
+        is_present = p.id in present_ids
+        if scope == 'unmarked' and is_marked:
+            continue
+        if scope == 'present' and (not is_marked or not is_present):
+            continue
+        if scope == 'absent' and (not is_marked or is_present):
+            continue
+
+        extra = _daily_att_extra_row(p)
+        phone = _normalize_phone(extra.get('parent_whatsapp'))
+        if not phone:
+            skipped += 1
+            continue
+        status_human = 'Present' if is_present else ('Absent' if is_marked else 'Not recorded')
+        ctx = {
+            'exam_title': '',
+            'attendance_date': attendance_date_label,
+            'student_name': p.name,
+            'clicker_id': p.clicker_id,
+            'status': status_human,
+        }
+        try:
+            text = _render(message, ctx)
+            wa_link = f'https://wa.me/{phone}?text={quote(text)}'
+            links.append({
+                'participant_id': p.id,
+                'student_name': p.name,
+                'phone': phone,
+                'link': wa_link,
+            })
+            sent += 1
+        except Exception as e:
+            errors.append(f'Participant {p.id}: {str(e)}')
+
+    return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'links': links})
+
+
 # Question Views
 class QuestionViewSet(viewsets.ModelViewSet):
     serializer_class = QuestionSerializer
@@ -1331,9 +1792,36 @@ class ParticipantViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         exam_id = self.request.query_params.get('exam_id')
+        school_id_param = self.request.query_params.get('school_id')
+        teacher_id_param = (
+            self.request.query_params.get('teacher_id')
+            or self.request.query_params.get('created_by')
+        )
         user = self.request.user
         base_order = [Length('clicker_id'), 'clicker_id']
         base_qs = scope_participants_queryset(Participant.objects.all(), user)
+        role = get_user_role(user)
+        if school_id_param not in (None, ''):
+            try:
+                sid = int(school_id_param)
+            except (TypeError, ValueError):
+                sid = None
+            if sid is not None:
+                if role == ROLE_SCHOOL_ADMIN:
+                    user_school = get_user_school_id(user)
+                    if user_school is not None and sid != user_school:
+                        base_qs = base_qs.none()
+                    else:
+                        base_qs = base_qs.filter(school_id=sid)
+                else:
+                    base_qs = base_qs.filter(school_id=sid)
+        if teacher_id_param not in (None, ''):
+            try:
+                tid = int(teacher_id_param)
+            except (TypeError, ValueError):
+                tid = None
+            if tid is not None:
+                base_qs = base_qs.filter(created_by_id=tid)
         if exam_id:
             exam_qs = scope_exams_queryset(Exam.objects.all(), user)
             try:

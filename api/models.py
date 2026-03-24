@@ -191,6 +191,35 @@ class Participant(models.Model):
         return self.name
 
 
+class DailyAttendance(models.Model):
+    """Attendance for a participant on a calendar day — independent of exams."""
+    participant = models.ForeignKey(
+        Participant, on_delete=models.CASCADE, related_name='daily_attendance_records'
+    )
+    date = models.DateField(db_index=True)
+    present = models.BooleanField(default=False)
+    recorded_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='recorded_daily_attendance'
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-date', 'participant_id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['participant', 'date'],
+                name='uniq_daily_attendance_participant_date',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['date', 'participant']),
+        ]
+
+    def __str__(self):
+        return f'{self.participant_id} {self.date} {"P" if self.present else "A"}'
+
+
 class ExamParticipant(models.Model):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='exam_participants')
     participant = models.ForeignKey(Participant, on_delete=models.CASCADE, related_name='participant_exams')
