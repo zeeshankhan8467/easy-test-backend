@@ -24,6 +24,8 @@ import pandas as pd
 import json
 import logging
 import re
+import os
+import uuid
 import html as html_module
 from urllib.parse import quote
 from io import BytesIO
@@ -1400,6 +1402,47 @@ def daily_attendance_send_parent_whatsapp(request):
             errors.append(f'Participant {p.id}: {str(e)}')
 
     return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'links': links})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def upload_question_media(request):
+    """Upload image or video for question rich text (stored under MEDIA_ROOT). Returns JSON { url }."""
+    from django.core.files.storage import default_storage
+
+    uploaded = request.FILES.get('file')
+    if not uploaded:
+        return Response({'detail': 'No file provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    orig = (uploaded.name or 'file').strip()
+    ext = os.path.splitext(orig)[1].lower()
+    if not ext:
+        return Response({'detail': 'File must have an extension.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    allowed_img = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+    allowed_vid = {'.mp4', '.webm', '.ogg', '.mov', '.m4v'}
+    is_img = ext in allowed_img
+    is_vid = ext in allowed_vid
+    if not is_img and not is_vid:
+        return Response(
+            {
+                'detail': f'Unsupported file type. Images: {sorted(allowed_img)}. Video: {sorted(allowed_vid)}.',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    max_image = 15 * 1024 * 1024
+    max_video = 120 * 1024 * 1024
+    max_bytes = max_image if is_img else max_video
+    if uploaded.size > max_bytes:
+        return Response({'detail': 'File too large.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    sub = 'images' if is_img else 'videos'
+    key = f'question_media/{sub}/{uuid.uuid4().hex}{ext}'
+    saved_name = default_storage.save(key, uploaded)
+    relative = default_storage.url(saved_name)
+    full_url = request.build_absolute_uri(relative)
+    return Response({'url': full_url})
 
 
 # Question Views
