@@ -1464,15 +1464,44 @@ class QuestionViewSet(viewsets.ModelViewSet):
         qs = Question.objects.all()
         user = self.request.user
         role = get_user_role(user)
+        params = self.request.query_params
+
+        def _parse_int(raw):
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+
+        school_id_param = _parse_int(params.get('school_id'))
+        teacher_id_param = _parse_int(params.get('teacher_id') or params.get('created_by'))
+
+        # RBAC scope first
         if role == ROLE_SUPER_ADMIN:
+            # optional filter for super admin
+            if school_id_param is not None:
+                qs = qs.filter(created_by__profile__school_id=school_id_param)
+            if teacher_id_param is not None:
+                qs = qs.filter(created_by_id=teacher_id_param)
             return qs
+
         if role == ROLE_SCHOOL_ADMIN:
-            school_id = get_user_school_id(user)
-            if not school_id:
+            user_school_id = get_user_school_id(user)
+            if not user_school_id:
                 return qs.none()
-            return qs.filter(created_by__profile__school_id=school_id)
+            qs = qs.filter(created_by__profile__school_id=user_school_id)
+            # allow further narrowing
+            if school_id_param is not None and school_id_param != user_school_id:
+                return qs.none()
+            if teacher_id_param is not None:
+                qs = qs.filter(created_by_id=teacher_id_param)
+            return qs
+
         if role == ROLE_TEACHER:
+            # teacher can only see their own questions; if they ask for another teacher, return none
+            if teacher_id_param is not None and teacher_id_param != user.id:
+                return qs.none()
             return qs.filter(created_by=user)
+
         return qs.none()
 
     def _normalize_topic(self, raw: str) -> str:
