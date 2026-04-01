@@ -264,7 +264,8 @@ class Answer(models.Model):
     selected_answer = models.JSONField(help_text="Selected answer index or indices")
     is_correct = models.BooleanField(default=False)
     time_taken = models.IntegerField(default=0, help_text="Time taken for this question in seconds")
-    answered_at = models.DateTimeField(auto_now_add=True)
+    # Client-reported instant (live sync); not auto_now so sync can persist clicker timestamps.
+    answered_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         unique_together = ['attempt', 'question']

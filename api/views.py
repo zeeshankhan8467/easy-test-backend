@@ -364,6 +364,36 @@ class ExamViewSet(viewsets.ModelViewSet):
             pk, len(responses_data), len(attendance_ids)
         )
 
+        def _parse_answered_at_for_sync(raw):
+            if not raw:
+                return None
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+                if timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt)
+                return dt
+            except (ValueError, TypeError):
+                return None
+
+        def _response_chronological_key(item):
+            dt = _parse_answered_at_for_sync(item.get('answered_at'))
+            pid = item.get('participant_id')
+            try:
+                pid_key = int(pid) if pid is not None else -1
+            except (TypeError, ValueError):
+                pid_key = -1
+            cid = str(item.get('clicker_id') or '')
+            ts = dt.timestamp() if dt else 0.0
+            qid = item.get('question_id')
+            try:
+                q_key = int(qid) if qid is not None else 0
+            except (TypeError, ValueError):
+                q_key = 0
+            return (pid_key, cid, ts, q_key)
+
+        responses_data = sorted(responses_data, key=_response_chronological_key)
+
         # Build snapshot question lookup (question_id -> correct_answer, positive_marks, negative_marks)
         snapshot = exam.snapshot_data or {}
         questions_list = snapshot.get('questions', [])
@@ -532,30 +562,24 @@ class ExamViewSet(viewsets.ModelViewSet):
             correct = is_correct(qinfo, selected)
             pos = float(qinfo.get('positive_marks', 1))
             neg = float(qinfo.get('negative_marks', 0))
+            answered_dt = _parse_answered_at_for_sync(item.get('answered_at'))
             time_taken = 0
-            if item.get('answered_at') and attempt.started_at:
+            if answered_dt and attempt.started_at:
                 try:
-                    raw = item['answered_at']
-                    if isinstance(raw, str):
-                        from datetime import datetime
-                        answered = datetime.fromisoformat(raw.replace('Z', '+00:00'))
-                        if timezone.is_naive(answered):
-                            answered = timezone.make_aware(answered)
-                    else:
-                        answered = raw
-                    # Per-question time: delta from previous answer (or exam start for first answer)
+                    # Per-question time: delta from previous answer (or exam start for first answer).
+                    # answered_at on rows must be client time so prev lookup matches this chain.
                     prev = (
-                        Answer.objects.filter(attempt=attempt, answered_at__lt=answered)
+                        Answer.objects.filter(attempt=attempt, answered_at__lt=answered_dt)
                         .order_by('-answered_at')
                         .values_list('answered_at', flat=True)
                         .first()
                     )
                     base = prev if prev else attempt.started_at
-                    time_taken = max(0, int((answered - base).total_seconds()))
+                    time_taken = max(0, int((answered_dt - base).total_seconds()))
                     logger.info(
                         '[sync_live_results] TIME_TAKEN DEBUG: question_id=%s participant_id=%s '
                         'base=%s answered_at=%s -> time_taken(sec)=%s',
-                        question_id, participant.id, base, raw, time_taken
+                        question_id, participant.id, base, item.get('answered_at'), time_taken
                     )
                 except Exception as e:
                     logger.warning('[sync_live_results] TIME_TAKEN DEBUG: failed to compute time_taken: %s', e)
@@ -567,13 +591,18 @@ class ExamViewSet(viewsets.ModelViewSet):
                         question_id, item.get('answered_at'), getattr(attempt, 'started_at', None)
                     )
 
+            answer_at_to_store = answered_dt if answered_dt else timezone.now()
+
             existing = Answer.objects.filter(attempt=attempt, question_id=question_id).first()
             if existing:
                 if exam.revisable:
                     existing.selected_answer = selected if isinstance(selected, list) else [selected]
                     existing.is_correct = correct
                     existing.time_taken = time_taken
-                    existing.save()
+                    existing.answered_at = answer_at_to_store
+                    existing.save(
+                        update_fields=['selected_answer', 'is_correct', 'time_taken', 'answered_at']
+                    )
                     answers_updated += 1
                 else:
                     skipped_already_answered += 1
@@ -584,7 +613,8 @@ class ExamViewSet(viewsets.ModelViewSet):
                 question_id=question_id,
                 selected_answer=selected if isinstance(selected, list) else [selected],
                 is_correct=correct,
-                time_taken=time_taken
+                time_taken=time_taken,
+                answered_at=answer_at_to_store,
             )
             answers_created += 1
 
@@ -610,9 +640,8 @@ class ExamViewSet(viewsets.ModelViewSet):
             attempt.score = total_marks
             attempt.submitted_at = timezone.now()
             if answers.exists():
-                last_ans = answers.order_by('-answered_at').first()
-                if last_ans and attempt.started_at:
-                    attempt.time_taken = max(0, int((last_ans.answered_at - attempt.started_at).total_seconds()))
+                # Sum per-question seconds so leaderboard / exports match "Speed" column totals.
+                attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
             attempt.save()
 
         # Assign all listed participants to the exam and mark present those who responded
@@ -3439,6 +3468,23 @@ def student_performance_report_export(request):
 
 
 # Leaderboard Views
+def _seconds_per_attempt_from_answers(exam):
+    """Total time per attempt = sum(Answer.time_taken); same basis as report 'Speed' column."""
+    rows = (
+        Answer.objects.filter(attempt__exam=exam)
+        .values('attempt_id')
+        .annotate(total=Sum('time_taken'))
+    )
+    return {r['attempt_id']: max(0, int(r['total'] or 0)) for r in rows}
+
+
+def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
+    """Prefer sum of answer times so leaderboard matches participant report; fallback stored field."""
+    if attempt.id in seconds_from_answers:
+        return seconds_from_answers[attempt.id]
+    return max(0, int(attempt.time_taken or 0))
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def leaderboard(request, exam_id):
@@ -3447,11 +3493,21 @@ def leaderboard(request, exam_id):
         exam = qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
-    
-    attempts = ExamAttempt.objects.filter(exam=exam).order_by('-score', 'time_taken')
-    
+
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts = list(
+        ExamAttempt.objects.filter(exam=exam).select_related('participant')
+    )
+    attempts.sort(
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        )
+    )
+
     entries = []
     for rank, attempt in enumerate(attempts, 1):
+        display_time = _leaderboard_display_time_seconds(attempt, seconds_from_answers)
         entries.append({
             'rank': rank,
             'participant_id': attempt.participant.id,
@@ -3460,7 +3516,7 @@ def leaderboard(request, exam_id):
             'percentage': float(attempt.percentage),
             'total_questions': attempt.total_questions,
             'correct_answers': attempt.correct_answers,
-            'time_taken': attempt.time_taken
+            'time_taken': display_time
         })
     
     leaderboard_data = {
@@ -3491,9 +3547,19 @@ def export_leaderboard(request, exam_id):
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
 
-    attempts = ExamAttempt.objects.filter(exam=exam).order_by('-score', 'time_taken')
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts = list(
+        ExamAttempt.objects.filter(exam=exam).select_related('participant')
+    )
+    attempts.sort(
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        )
+    )
     entries = []
     for rank, attempt in enumerate(attempts, 1):
+        display_time = _leaderboard_display_time_seconds(attempt, seconds_from_answers)
         entries.append({
             'Rank': rank,
             'Participant ID': attempt.participant.id,
@@ -3502,7 +3568,7 @@ def export_leaderboard(request, exam_id):
             'Correct': attempt.correct_answers,
             'Total Questions': attempt.total_questions,
             'Percentage': float(attempt.percentage),
-            'Time Taken (sec)': attempt.time_taken,
+            'Time Taken (sec)': display_time,
         })
 
     filename_base = f'leaderboard-{exam.id}'
