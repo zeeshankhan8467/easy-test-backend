@@ -491,6 +491,7 @@ class ParticipantResultSerializer(serializers.Serializer):
     wrong_answers = serializers.IntegerField()
     unattempted = serializers.IntegerField()
     percentage = serializers.FloatField()
+    time_taken = serializers.IntegerField()
     rank = serializers.IntegerField()
 
 

@@ -29,7 +29,7 @@ import uuid
 import html as html_module
 from urllib.parse import quote
 from io import BytesIO
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -763,7 +763,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         elements = [
             Paragraph(f'Attendance Report - {exam.title}', styles['Title']),
             Spacer(1, 12),
-            Paragraph(f'Generated at: {timezone.now().strftime("%d/%m/%Y %H:%M")}', styles['Normal']),
+            Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
             Spacer(1, 12),
         ]
 
@@ -1216,7 +1216,7 @@ def daily_attendance_export(request):
     elements = [
         Paragraph(title, styles['Title']),
         Spacer(1, 12),
-        Paragraph(f'Generated at: {timezone.now().strftime("%d/%m/%Y %H:%M")}', styles['Normal']),
+        Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
         Spacer(1, 12),
     ]
     table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status']] + [
@@ -2362,11 +2362,6 @@ def _report_datetime_ist():
     """Return current datetime string in IST, format dd/mm/yyyy HH:MM (e.g. 08/03/2026 14:30)."""
     return _report_now_ist().strftime('%d/%m/%Y %H:%M')
 
-
-def _report_datetime_ist_12h():
-    """Return current datetime string in IST with 12-hour AM/PM (e.g. 08/03/2026 02:30 PM)."""
-    return _report_now_ist().strftime('%d/%m/%Y %I:%M:%S %p')
-
 # Participant fields to include in report export (label for display, key in Participant.extra or model)
 PARTICIPANT_REPORT_FIELDS = [
     ('Name', 'name'),
@@ -2455,6 +2450,23 @@ def _participant_report_row(participant):
     return row
 
 
+def _seconds_per_attempt_from_answers(exam):
+    """Total time per attempt = sum(Answer.time_taken); same basis as leaderboard and report Speed columns."""
+    rows = (
+        Answer.objects.filter(attempt__exam=exam)
+        .values('attempt_id')
+        .annotate(total=Sum('time_taken'))
+    )
+    return {r['attempt_id']: max(0, int(r['total'] or 0)) for r in rows}
+
+
+def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
+    """Prefer sum of answer times (leaderboard / exports); fallback to stored attempt field."""
+    if attempt.id in seconds_from_answers:
+        return seconds_from_answers[attempt.id]
+    return max(0, int(attempt.time_taken or 0))
+
+
 def _get_exam_report_data(exam):
     """Build report data dict for an exam (no request needed). Used by exam_report and export."""
     attempts = ExamAttempt.objects.filter(exam=exam)
@@ -2507,10 +2519,19 @@ def _get_exam_report_data(exam):
             'correct_answer': _normalize_correct_answer(question.correct_answer),
             'option_votes': option_votes,
         })
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts_sorted = list(attempts.select_related('participant'))
+    attempts_sorted.sort(
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        )
+    )
     participant_results = []
-    for attempt in attempts.order_by('-score', 'time_taken'):
+    for attempt in attempts_sorted:
         p = attempt.participant
         user_row = _participant_report_row(p)
+        display_time = _leaderboard_display_time_seconds(attempt, seconds_from_answers)
         participant_results.append({
             'participant_id': p.id,
             'participant_name': p.name,
@@ -2537,6 +2558,7 @@ def _get_exam_report_data(exam):
             'wrong_answers': attempt.wrong_answers,
             'unattempted': attempt.unattempted,
             'percentage': float(attempt.percentage),
+            'time_taken': display_time,
             'rank': 0
         })
     for idx, result in enumerate(participant_results, 1):
@@ -2620,10 +2642,12 @@ def _format_attempted_option_label(question, selected_answer):
     return str(selected_answer + 1)
 
 
-def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None):
+def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
     """Write 'Results by Participants(Detail)' sheet to match client format: metadata, then per-participant blocks with Keypad/Name line and table Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data."""
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     sheet_name = 'Results by Participants(Detail)'
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
@@ -2637,19 +2661,22 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
-    # Rank by score (desc), then time_taken (asc: faster = better). Rank 1 = best.
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempts_ranked = sorted(
-        ExamAttempt.objects.filter(exam=exam).values_list('id', 'score', 'time_taken'),
-        key=lambda x: (-float(x[1]), x[2] or 0)
+        ExamAttempt.objects.filter(exam=exam),
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        ),
     )
-    rank_by_attempt_id = {aid: rank for rank, (aid, _s, _t) in enumerate(attempts_ranked, 1)}
+    rank_by_attempt_id = {a.id: rank for rank, a in enumerate(attempts_ranked, 1)}
     total_participants = len(attempts_ranked)
 
     row_num = 1
     ws.cell(row=row_num, column=1, value='Results by Participants(Detail)')
     ws.cell(row=row_num, column=1).font = Font(bold=True, size=14)
     row_num += 1
-    ws.cell(row=row_num, column=1, value=_report_datetime_ist())
+    ws.cell(row=row_num, column=1, value=report_timestamp_str)
     row_num += 1
     ws.cell(row=row_num, column=1, value=f'Questions Count: {len(exam_questions)}')
     row_num += 2
@@ -2713,7 +2740,8 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
                 speed = ''
                 score = 0
             ws.cell(row=row_num, column=1, value=f'{order_idx}. {_strip_html(q.text)}')
-            ws.cell(row=row_num, column=2, value=options_text)
+            opt_cell = ws.cell(row=row_num, column=2, value=options_text)
+            opt_cell.alignment = Alignment(wrap_text=True, vertical='top')
             ws.cell(row=row_num, column=3, value=response_val)
             ws.cell(row=row_num, column=4, value='Choice')
             ws.cell(row=row_num, column=5, value=correct_display)
@@ -2738,10 +2766,12 @@ def _sanitize_sheet_name(name):
     return (name or 'Sheet')[:31]
 
 
-def _write_results_by_participants_individual(workbook, exam, participant_detail_columns=None):
+def _write_results_by_participants_individual(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
     """One sheet per participant (sheet name = keypad id). Same layout as reference: title, date, questions count, metadata, Keypad summary, then Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data (if participant_detail_columns provided)."""
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     red_header_fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
     white_font = Font(color='FFFFFF', bold=True)
     bold_font = Font(bold=True)
@@ -2752,16 +2782,19 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
-    # Rank by score (desc), then time_taken (asc). Rank 1 = best.
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempts_ranked = sorted(
-        ExamAttempt.objects.filter(exam=exam).values_list('id', 'score', 'time_taken'),
-        key=lambda x: (-float(x[1]), x[2] or 0)
+        ExamAttempt.objects.filter(exam=exam),
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        ),
     )
-    rank_by_attempt_id = {aid: rank for rank, (aid, _s, _t) in enumerate(attempts_ranked, 1)}
+    rank_by_attempt_id = {a.id: rank for rank, a in enumerate(attempts_ranked, 1)}
     total_participants = len(attempts_ranked)
 
     n_questions = len(exam_questions)
-    report_date = _report_datetime_ist()
+    report_date = report_timestamp_str
 
     for attempt in attempts:
         participant = attempt.participant
@@ -2836,7 +2869,8 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
                 speed = ''
                 score = 0
             ws.cell(row=row, column=1, value=f'{order_idx}. {_strip_html(q.text)}')
-            ws.cell(row=row, column=2, value=options_text)
+            opt_cell = ws.cell(row=row, column=2, value=options_text)
+            opt_cell.alignment = Alignment(wrap_text=True, vertical='top')
             ws.cell(row=row, column=3, value=response_val)
             ws.cell(row=row, column=4, value='Choice')
             ws.cell(row=row, column=5, value=correct_display)
@@ -2859,8 +2893,10 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
             break
 
 
-def _write_results_by_questions_sheet(workbook, exam):
+def _write_results_by_questions_sheet(workbook, exam, report_timestamp_str=None):
     """One sheet 'Results by Questions': per-question blocks with Option, Voted, Percentage (like reference)."""
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     sheet_name = 'Results by Questions'
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
@@ -2882,7 +2918,7 @@ def _write_results_by_questions_sheet(workbook, exam):
     row += 1
     ws.cell(row=row, column=1, value=exam.title or '')
     row += 1
-    ws.cell(row=row, column=1, value=_report_datetime_ist_12h())
+    ws.cell(row=row, column=1, value=report_timestamp_str)
     row += 2
     for label, col_b in [
         ('Sl No.', ''),
@@ -2963,8 +2999,10 @@ PERSONAL_ACHIEVEMENT_HEADERS = [
 ]
 
 
-def _write_personal_achievement_and_detail_sheet(workbook, exam):
+def _write_personal_achievement_and_detail_sheet(workbook, exam, report_timestamp_str=None):
     """Write 'Personal Achievement and Detail' sheet: title, Voted, exam info, then table of participants with details + score + per-question columns."""
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     sheet_name = 'Personal Achievement and Detail'
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
@@ -2982,10 +3020,13 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
-    # Rank attempted by score (desc), then time (asc)
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempted_list = sorted(
         [attempts_by_participant[ep.participant_id] for ep in assigned if ep.participant_id in attempts_by_participant],
-        key=lambda a: (-float(a.score), a.time_taken)
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        ),
     )
     rank_by_attempt = {a.id: idx + 1 for idx, a in enumerate(attempted_list)}
     voted_count = len(attempted_list)
@@ -3000,7 +3041,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
     row += 1
     ws.cell(row=row, column=1, value=exam.title or '')
     row += 1
-    ws.cell(row=row, column=1, value=_report_datetime_ist())
+    ws.cell(row=row, column=1, value=report_timestamp_str)
     row += 1
     for label, col_b in [
         ('Sl No.', ''),
@@ -3101,10 +3142,11 @@ def _build_export_http_response(request, exam):
     raw = (request.query_params.get('format') or 'excel').strip().lower()
     format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
     layout = (request.query_params.get('layout') or '').strip().lower()
+    report_timestamp_str = _report_datetime_ist()
     report_data = _get_exam_report_data(exam)
     detail_columns = report_data.get('participant_detail_columns') or []
     detail_keys = [k for (_, k) in detail_columns]
-    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'rank']
+    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'time_taken', 'rank']
     export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
     df = df[[c for c in export_columns if c in df.columns]]
@@ -3116,10 +3158,15 @@ def _build_export_http_response(request, exam):
         content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             if layout == 'personal_achievement':
-                _write_personal_achievement_and_detail_sheet(writer.book, exam)
+                _write_personal_achievement_and_detail_sheet(
+                    writer.book, exam, report_timestamp_str=report_timestamp_str
+                )
                 filename = f'report-{exam.id}-personal-achievement.xlsx'
             else:
-                _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
+                _write_results_by_participants_detail_sheet(
+                    writer.book, exam, participant_detail_columns=detail_columns,
+                    report_timestamp_str=report_timestamp_str,
+                )
                 filename = f'report-{exam.id}.xlsx'
     else:
         content_type = 'text/csv'
@@ -3153,10 +3200,11 @@ export_report.renderer_classes = [BinaryFileRenderer]
 
 def _build_export_file_response(format_type, exam, layout=None):
     """Build Excel or CSV as Django HttpResponse. layout='individual' => one sheet per participant; layout='questions' => Results by Questions; layout='personal_achievement' => Personal Achievement and Detail."""
+    report_timestamp_str = _report_datetime_ist()
     report_data = _get_exam_report_data(exam)
     detail_columns = report_data.get('participant_detail_columns') or []
     detail_keys = [k for (_, k) in detail_columns]
-    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'rank']
+    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'time_taken', 'rank']
     export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
     df = df[[c for c in export_columns if c in df.columns]]
@@ -3168,10 +3216,13 @@ def _build_export_file_response(format_type, exam, layout=None):
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             layout_l = (layout or '').strip().lower()
             if layout_l == 'individual':
-                _write_results_by_participants_individual(writer.book, exam, participant_detail_columns=detail_columns)
+                _write_results_by_participants_individual(
+                    writer.book, exam, participant_detail_columns=detail_columns,
+                    report_timestamp_str=report_timestamp_str,
+                )
                 filename = f'report-{exam.id}-individual.xlsx'
             elif layout_l == 'questions':
-                _write_results_by_questions_sheet(writer.book, exam)
+                _write_results_by_questions_sheet(writer.book, exam, report_timestamp_str=report_timestamp_str)
                 # Remove default sheet if pandas created one
                 for default in ('Sheet', 'Sheet1'):
                     if default in writer.book.sheetnames and len(writer.book.sheetnames) > 1:
@@ -3179,10 +3230,15 @@ def _build_export_file_response(format_type, exam, layout=None):
                         break
                 filename = f'report-{exam.id}-questions.xlsx'
             elif layout_l == 'personal_achievement':
-                _write_personal_achievement_and_detail_sheet(writer.book, exam)
+                _write_personal_achievement_and_detail_sheet(
+                    writer.book, exam, report_timestamp_str=report_timestamp_str
+                )
                 filename = f'report-{exam.id}-personal-achievement.xlsx'
             else:
-                _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
+                _write_results_by_participants_detail_sheet(
+                    writer.book, exam, participant_detail_columns=detail_columns,
+                    report_timestamp_str=report_timestamp_str,
+                )
                 filename = f'report-{exam.id}.xlsx'
         content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     else:
@@ -3468,23 +3524,6 @@ def student_performance_report_export(request):
 
 
 # Leaderboard Views
-def _seconds_per_attempt_from_answers(exam):
-    """Total time per attempt = sum(Answer.time_taken); same basis as report 'Speed' column."""
-    rows = (
-        Answer.objects.filter(attempt__exam=exam)
-        .values('attempt_id')
-        .annotate(total=Sum('time_taken'))
-    )
-    return {r['attempt_id']: max(0, int(r['total'] or 0)) for r in rows}
-
-
-def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
-    """Prefer sum of answer times so leaderboard matches participant report; fallback stored field."""
-    if attempt.id in seconds_from_answers:
-        return seconds_from_answers[attempt.id]
-    return max(0, int(attempt.time_taken or 0))
-
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def leaderboard(request, exam_id):
@@ -3592,7 +3631,7 @@ def export_leaderboard(request, exam_id):
     elements = [
         Paragraph(f'Leaderboard - {exam.title}', styles['Title']),
         Spacer(1, 12),
-        Paragraph(f'Generated at: {timezone.now().strftime("%d/%m/%Y %H:%M")}', styles['Normal']),
+        Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
         Spacer(1, 12),
     ]
 
