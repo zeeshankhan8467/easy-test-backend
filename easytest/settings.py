@@ -195,3 +195,33 @@ EMAIL_TIMEOUT = int((os.getenv('EMAIL_TIMEOUT', '10') or '').strip() or '10')
 
 # Always use SMTP so the "send email to parent" feature works in dev.
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+
+# Logging: ensure our time-tracking debug logs from `api.views` are visible in dev.
+# Without this, Django's default logging often suppresses `logger.info(...)` output.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {
+            'format': '[{levelname}] {name}: {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'api.views': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}

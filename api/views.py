@@ -27,6 +27,8 @@ import re
 import os
 import uuid
 import html as html_module
+import urllib.request
+import urllib.error
 from urllib.parse import quote
 from io import BytesIO
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -37,6 +39,179 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
 logger = logging.getLogger(__name__)
+
+def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
+    """
+    Send WhatsApp message via msg91 outbound API (text).
+    Requires env vars:
+      - MSG91_AUTHKEY
+      - MSG91_INTEGRATED_NUMBER
+      - MSG91_WHATSAPP_OUTBOUND_URL (optional; default control.msg91.com v5 outbound endpoint)
+    """
+    authkey = (os.getenv('MSG91_AUTHKEY') or '').strip()
+    integrated_number = (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip()
+    outbound_url = (os.getenv(
+        'MSG91_WHATSAPP_OUTBOUND_URL',
+        'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/',
+    ) or '').strip()
+
+    if not authkey:
+        raise ValueError('Missing MSG91_AUTHKEY in environment.')
+    if not integrated_number:
+        raise ValueError('Missing MSG91_INTEGRATED_NUMBER in environment.')
+    if not outbound_url:
+        raise ValueError('Missing MSG91_WHATSAPP_OUTBOUND_URL in environment.')
+    if not recipient_number:
+        raise ValueError('Missing recipient_number.')
+    if text is None:
+        text = ''
+
+    payload = {
+        'integrated_number': integrated_number,
+        'recipient_number': recipient_number,
+        'content_type': 'text',
+        'text': text,
+    }
+    data = json.dumps(payload).encode('utf-8')
+
+    req = urllib.request.Request(
+        outbound_url,
+        data=data,
+        headers={
+            'Authkey': authkey,
+            'accept': 'application/json',
+            'content-type': 'application/json',
+        },
+        method='POST',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {'raw': raw}
+    except urllib.error.HTTPError as e:
+        raw = ''
+        try:
+            raw = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            raw = str(e)
+        raise RuntimeError(f'Msg91 HTTPError: {e.code} {raw}')
+    except Exception as e:
+        raise RuntimeError(f'Msg91 request failed: {str(e)}')
+
+
+def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
+    """
+    Send WhatsApp outbound message using a pre-approved WhatsApp template (single body component).
+
+    This code assumes your template's body has exactly ONE dynamic variable, and MSG91 will map it to `body_1`.
+
+    Required env vars:
+      - MSG91_AUTHKEY
+      - MSG91_INTEGRATED_NUMBER
+      - MSG91_WHATSAPP_TEMPLATE_NAME
+      - MSG91_WHATSAPP_TEMPLATE_NAMESPACE
+      - MSG91_WHATSAPP_TEMPLATE_LANGUAGE_CODE (optional, default: en)
+    """
+    authkey = (os.getenv('MSG91_AUTHKEY') or '').strip()
+    integrated_number = (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip()
+    template_name = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip()
+    template_namespace = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAMESPACE') or '').strip()
+    template_lang = (os.getenv('MSG91_WHATSAPP_TEMPLATE_LANGUAGE_CODE') or 'en').strip()
+    outbound_url = (os.getenv(
+        'MSG91_WHATSAPP_TEMPLATE_OUTBOUND_URL',
+        'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+    ) or '').strip()
+
+    if not authkey:
+        raise ValueError('Missing MSG91_AUTHKEY in environment.')
+    if not integrated_number:
+        raise ValueError('Missing MSG91_INTEGRATED_NUMBER in environment.')
+    if not template_name:
+        raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_NAME in environment.')
+    if not template_namespace:
+        raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_NAMESPACE in environment.')
+    if not outbound_url:
+        raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_OUTBOUND_URL in environment.')
+    if not recipient_number:
+        raise ValueError('Missing recipient_number.')
+    if text is None:
+        text = ''
+
+    # We send the full rendered message as the single body parameter (body_1).
+    payload = {
+        'integrated_number': integrated_number,
+        'content_type': 'template',
+        'payload': {
+            'messaging_product': 'whatsapp',
+            'type': 'template',
+            'template': {
+                'name': template_name,
+                'language': {
+                    'code': template_lang,
+                    'policy': 'deterministic',
+                },
+                'namespace': template_namespace,
+                'to_and_components': [
+                    {
+                        'to': [recipient_number],
+                        'components': {
+                            'body_1': {
+                                'type': 'text',
+                                'value': text,
+                            }
+                        },
+                    }
+                ],
+            }
+        },
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+
+    req = urllib.request.Request(
+        outbound_url,
+        data=data,
+        headers={
+            'Authkey': authkey,
+            'accept': 'application/json',
+            'content-type': 'application/json',
+        },
+        method='POST',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {'raw': raw}
+    except urllib.error.HTTPError as e:
+        raw = ''
+        try:
+            raw = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            raw = str(e)
+        raise RuntimeError(f'Msg91 HTTPError: {e.code} {raw}')
+    except Exception as e:
+        raise RuntimeError(f'Msg91 request failed: {str(e)}')
+
+
+def _msg91_send_whatsapp_message(recipient_number: str, text: str) -> dict:
+    """
+    Choose template-based sending if template env vars are configured,
+    otherwise fall back to text sending.
+    """
+    template_name = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip()
+    return (
+        _msg91_send_whatsapp_template(recipient_number, text)
+        if template_name
+        else _msg91_send_whatsapp_text(recipient_number, text)
+    )
 
 from .models import (
     Exam, Question, ExamQuestion, Participant,
@@ -327,14 +502,19 @@ class ExamViewSet(viewsets.ModelViewSet):
         Submit live clicker responses and attendance from EasyTest Live app.
         Body: {
             "responses": [
-                {"participant_id": 1, "question_id": 2, "selected_answer": 0, "answered_at": "ISO8601"},
-                {"clicker_id": "123", ...}  // alternative: resolve participant by clicker_id
+                {"participant_id": 1, "question_id": 2, "selected_answer": 0,
+                 "answered_at": "ISO8601 (+05:30 IST ok)", "time_taken": 12},
+                {"clicker_id": "123", ...}  # alternative: resolve participant by clicker_id
             ],
-            "attendance": [1, 2, 3]  // optional: participant_ids to mark present
+            "attendance": [1, 2, 3]  # optional: participant_ids to mark present
         }
         selected_answer: 0-based index (MCQ) or list of indices (multiple_select). Letter "A"=0, "B"=1, etc.
         """
         exam = self.get_object()
+        # Debug: confirm endpoint is being hit and this terminal is receiving logs.
+        # Use print+flush so it shows even if logging config suppresses logger.*.
+        print(f"[sync_live_results] Endpoint hit for exam id={pk}", flush=True)
+        logger.warning('[sync_live_results] Endpoint hit for exam id=%s', pk)
         if exam.status not in ('frozen', 'completed'):
             logger.warning('[sync_live_results] Exam %s not frozen/completed, status=%s', pk, exam.status)
             return Response(
@@ -564,10 +744,22 @@ class ExamViewSet(viewsets.ModelViewSet):
             neg = float(qinfo.get('negative_marks', 0))
             answered_dt = _parse_answered_at_for_sync(item.get('answered_at'))
             time_taken = 0
-            if answered_dt and attempt.started_at:
+            used_client_time = False
+            if 'time_taken' in item:
                 try:
-                    # Per-question time: delta from previous answer (or exam start for first answer).
-                    # answered_at on rows must be client time so prev lookup matches this chain.
+                    time_taken = max(0, int(item.get('time_taken')))
+                    used_client_time = True
+                except (TypeError, ValueError):
+                    used_client_time = False
+            if used_client_time:
+                logger.info(
+                    '[sync_live_results] TIME_TAKEN DEBUG: question_id=%s participant_id=%s '
+                    'time_taken(sec)=%s from client; answered_at=%s',
+                    question_id, participant.id, time_taken, item.get('answered_at'),
+                )
+            elif answered_dt and attempt.started_at:
+                try:
+                    # Legacy: per-question time from timestamps — delta from previous answer or exam start.
                     prev = (
                         Answer.objects.filter(attempt=attempt, answered_at__lt=answered_dt)
                         .order_by('-answered_at')
@@ -578,7 +770,7 @@ class ExamViewSet(viewsets.ModelViewSet):
                     time_taken = max(0, int((answered_dt - base).total_seconds()))
                     logger.info(
                         '[sync_live_results] TIME_TAKEN DEBUG: question_id=%s participant_id=%s '
-                        'base=%s answered_at=%s -> time_taken(sec)=%s',
+                        'base=%s answered_at=%s -> time_taken(sec)=%s (computed)',
                         question_id, participant.id, base, item.get('answered_at'), time_taken
                     )
                 except Exception as e:
@@ -893,7 +1085,7 @@ class ExamViewSet(viewsets.ModelViewSet):
             "message": ".... {{exam_title}} {{student_name}} {{clicker_id}} {{status}} ...",
             "participant_ids": [1, 2, 3]  // optional
           }
-        Returns generated WhatsApp links (wa.me) for selected participants.
+        Sends WhatsApp messages via msg91 outbound API for selected participants.
         """
         exam = self.get_object()
         scope = (request.data.get('scope') or 'absent').strip().lower()
@@ -905,6 +1097,23 @@ class ExamViewSet(viewsets.ModelViewSet):
             return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
         if not message:
             return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Fail fast if msg91 is not configured
+        if not (os.getenv('MSG91_AUTHKEY') or '').strip() or not (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip():
+            return Response(
+                {
+                    'error': 'Msg91 WhatsApp is not configured. Set MSG91_AUTHKEY and MSG91_INTEGRATED_NUMBER in backend env.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # If template mode is enabled (template name set), ensure required template env vars exist.
+        if (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip() and not (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAMESPACE') or '').strip():
+            return Response(
+                {
+                    'error': 'Msg91 WhatsApp template is not configured. Set MSG91_WHATSAPP_TEMPLATE_NAMESPACE when MSG91_WHATSAPP_TEMPLATE_NAME is set.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
         if participant_ids:
@@ -918,7 +1127,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         sent = 0
         skipped = 0
         errors = []
-        links = []
+        messages = []
 
         def _render(template: str, ctx: dict) -> str:
             out = template
@@ -959,18 +1168,19 @@ class ExamViewSet(viewsets.ModelViewSet):
             }
             try:
                 text = _render(message, ctx)
-                wa_link = f'https://wa.me/{phone}?text={quote(text)}'
-                links.append({
+                resp = _msg91_send_whatsapp_message(phone, text)
+                msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
+                messages.append({
                     'participant_id': p.id,
                     'student_name': p.name,
                     'phone': phone,
-                    'link': wa_link,
+                    'message_id': msg_id,
                 })
                 sent += 1
             except Exception as e:
                 errors.append(f'Participant {p.id}: {str(e)}')
 
-        return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'links': links})
+        return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'messages': messages})
 
 
 def _parse_iso_date(date_str):
@@ -1359,6 +1569,23 @@ def daily_attendance_send_parent_whatsapp(request):
     if not message:
         return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
 
+    # Fail fast if msg91 is not configured
+    if not (os.getenv('MSG91_AUTHKEY') or '').strip() or not (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip():
+        return Response(
+            {
+                'error': 'Msg91 WhatsApp is not configured. Set MSG91_AUTHKEY and MSG91_INTEGRATED_NUMBER in backend env.',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    # If template mode is enabled, ensure required template env vars exist.
+    if (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip() and not (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAMESPACE') or '').strip():
+        return Response(
+            {
+                'error': 'Msg91 WhatsApp template is not configured. Set MSG91_WHATSAPP_TEMPLATE_NAMESPACE when MSG91_WHATSAPP_TEMPLATE_NAME is set.',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
     user = request.user
     pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
         Length('clicker_id'), 'clicker_id'
@@ -1383,7 +1610,7 @@ def daily_attendance_send_parent_whatsapp(request):
     sent = 0
     skipped = 0
     errors = []
-    links = []
+    messages = []
 
     def _render(template: str, ctx: dict) -> str:
         out = template
@@ -1419,18 +1646,19 @@ def daily_attendance_send_parent_whatsapp(request):
         }
         try:
             text = _render(message, ctx)
-            wa_link = f'https://wa.me/{phone}?text={quote(text)}'
-            links.append({
+            resp = _msg91_send_whatsapp_message(phone, text)
+            msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
+            messages.append({
                 'participant_id': p.id,
                 'student_name': p.name,
                 'phone': phone,
-                'link': wa_link,
+                'message_id': msg_id,
             })
             sent += 1
         except Exception as e:
             errors.append(f'Participant {p.id}: {str(e)}')
 
-    return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'links': links})
+    return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'messages': messages})
 
 
 @api_view(['POST'])
@@ -2485,9 +2713,9 @@ def _get_exam_report_data(exam):
     avg_score = attempts.aggregate(avg=Avg('score'))['avg'] or 0
     highest = attempts.aggregate(max=Max('score'))['max'] or 0
     lowest = attempts.aggregate(min=Min('score'))['min'] or 0
-    questions = exam.exam_questions.select_related('question').order_by('order')
+    questions_ordered = list(exam.exam_questions.select_related('question').order_by('order'))
     question_analysis = []
-    for eq in questions:
+    for eq in questions_ordered:
         question = eq.question
         answers = Answer.objects.filter(attempt__exam=exam, question=question)
         total_attempts = answers.count()
@@ -2527,11 +2755,25 @@ def _get_exam_report_data(exam):
             _leaderboard_display_time_seconds(a, seconds_from_answers),
         )
     )
+    answer_map_report = {
+        (a.attempt_id, a.question_id): a
+        for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question')
+    }
     participant_results = []
     for attempt in attempts_sorted:
         p = attempt.participant
         user_row = _participant_report_row(p)
         display_time = _leaderboard_display_time_seconds(attempt, seconds_from_answers)
+        question_answers = []
+        for eq in questions_ordered:
+            q = eq.question
+            ans = answer_map_report.get((attempt.id, q.id))
+            question_answers.append({
+                'question_id': q.id,
+                'response': _format_attempted_option_label(q, ans.selected_answer) if ans else '',
+                'correct_answer': _format_correct_answer_display(q),
+                'is_correct': ans.is_correct if ans else None,
+            })
         participant_results.append({
             'participant_id': p.id,
             'participant_name': p.name,
@@ -2559,7 +2801,8 @@ def _get_exam_report_data(exam):
             'unattempted': attempt.unattempted,
             'percentage': float(attempt.percentage),
             'time_taken': display_time,
-            'rank': 0
+            'rank': 0,
+            'question_answers': question_answers,
         })
     for idx, result in enumerate(participant_results, 1):
         result['rank'] = idx
@@ -2624,22 +2867,52 @@ def _option_label_for_index(index, option_display):
     return chr(65 + index) if 0 <= index < 26 else str(index + 1)
 
 
+def _question_option_display(question):
+    return getattr(question, 'option_display', 'alpha') or 'alpha'
+
+
+def _format_correct_answer_display(question):
+    """Correct option label(s) for reports: A/B/C or 1/2/3 per question option_display."""
+    raw = getattr(question, 'correct_answer', None)
+    if raw is None:
+        return ''
+    display = _question_option_display(question)
+    indices = _normalize_correct_answer(raw)
+    if not indices:
+        return ''
+    return ', '.join(_option_label_for_index(i, display) for i in indices)
+
+
 def _format_attempted_option_label(question, selected_answer):
-    """Return the attempted option label(s) for display as numeric (1, 2, 3...). For MCQ/true_false show single number; for multiple_select show comma-separated."""
+    """Attempted option label(s) for reports: A/B/C or 1/2/3 per question option_display."""
     if selected_answer is None:
         return ''
-    # Single-choice (MCQ, true_false): show one number only (if stored as list, take first)
+    display = _question_option_display(question)
     qtype = getattr(question, 'type', 'mcq')
     if qtype in ('mcq', 'true_false'):
         if isinstance(selected_answer, list):
             selected_answer = selected_answer[0] if selected_answer else None
         if selected_answer is None:
             return ''
-        return str(selected_answer + 1)
-    # Multiple-select: show comma-separated numbers
+        try:
+            idx = int(selected_answer)
+        except (TypeError, ValueError):
+            return str(selected_answer)
+        return _option_label_for_index(idx, display)
     if isinstance(selected_answer, list):
-        return ', '.join(str(i + 1) for i in selected_answer)
-    return str(selected_answer + 1)
+        parts = []
+        for i in selected_answer:
+            if i is None:
+                continue
+            try:
+                parts.append(_option_label_for_index(int(i), display))
+            except (TypeError, ValueError):
+                parts.append(str(i))
+        return ', '.join(parts)
+    try:
+        return _option_label_for_index(int(selected_answer), display)
+    except (TypeError, ValueError):
+        return str(selected_answer)
 
 
 def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
@@ -2721,17 +2994,10 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
             q = eq.question
             options_text = _format_question_options(q)
             answer = answer_map.get((attempt.id, q.id))
-            correct_idx = q.correct_answer
-            if isinstance(correct_idx, list):
-                correct_display = correct_idx[0] + 1 if correct_idx else ''
-            else:
-                correct_display = int(correct_idx) + 1 if correct_idx is not None else ''
+            correct_display = _format_correct_answer_display(q)
             if answer:
                 sel = answer.selected_answer
-                if isinstance(sel, list):
-                    response_val = (sel[0] + 1) if sel else ''
-                else:
-                    response_val = int(sel) + 1 if sel is not None else ''
+                response_val = _format_attempted_option_label(q, sel)
                 # Speed = time taken for this question in seconds (integer from DB)
                 speed = answer.time_taken if answer.time_taken is not None else 0
                 score = int(eq.positive_marks) if answer.is_correct else -int(eq.negative_marks)
@@ -2845,22 +3111,15 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
             c.fill = red_header_fill
             c.font = white_font
         row += 1
-        # One row per question (match reference: Response = 1-based index, Slide Type = 'Choice', Correct Answer = 1-based correct index, Speed = decimal)
+        # One row per question: Response / Correct Answer use option_display (alpha vs numeric).
         for order_idx, eq in enumerate(exam_questions, start=1):
             q = eq.question
             options_text = _format_question_options(q)
             answer = answer_map.get((attempt.id, q.id))
-            correct_idx = q.correct_answer
-            if isinstance(correct_idx, list):
-                correct_display = correct_idx[0] + 1 if correct_idx else ''
-            else:
-                correct_display = int(correct_idx) + 1 if correct_idx is not None else ''
+            correct_display = _format_correct_answer_display(q)
             if answer:
                 sel = answer.selected_answer
-                if isinstance(sel, list):
-                    response_val = (sel[0] + 1) if sel else ''
-                else:
-                    response_val = int(sel) + 1 if sel is not None else ''
+                response_val = _format_attempted_option_label(q, sel)
                 # Speed = time taken for this question in seconds
                 speed = answer.time_taken if answer.time_taken is not None else 0
                 score = int(eq.positive_marks) if answer.is_correct else -int(eq.negative_marks)

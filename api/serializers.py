@@ -466,6 +466,14 @@ class QuestionAnalysisSerializer(serializers.Serializer):
     option_votes = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
 
 
+class ParticipantQuestionAnswerSerializer(serializers.Serializer):
+    """Per-question row for report API: labels match question option_display (alpha vs numeric)."""
+    question_id = serializers.IntegerField()
+    response = serializers.CharField(allow_blank=True)
+    correct_answer = serializers.CharField(allow_blank=True)
+    is_correct = serializers.BooleanField(allow_null=True)
+
+
 class ParticipantResultSerializer(serializers.Serializer):
     participant_id = serializers.IntegerField()
     participant_name = serializers.CharField()
@@ -493,6 +501,7 @@ class ParticipantResultSerializer(serializers.Serializer):
     percentage = serializers.FloatField()
     time_taken = serializers.IntegerField()
     rank = serializers.IntegerField()
+    question_answers = ParticipantQuestionAnswerSerializer(many=True, required=False)
 
 
 class ExamReportSerializer(serializers.Serializer):
