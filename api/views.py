@@ -1,4 +1,4 @@
-from rest_framework import viewsets, status, renderers
+from rest_framework import viewsets, status, renderers, serializers as drf_serializers
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -17,22 +17,211 @@ from django.db.models.functions import Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_GET
+from django.core.mail import EmailMessage, get_connection
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from datetime import timedelta
 import pandas as pd
 import json
 import logging
 import re
+import os
+import uuid
 import html as html_module
+import urllib.request
+import urllib.error
+from urllib.parse import quote
 from io import BytesIO
-from openpyxl.styles import Font, PatternFill
+from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
 
 logger = logging.getLogger(__name__)
 
+def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
+    """
+    Send WhatsApp message via msg91 outbound API (text).
+    Requires env vars:
+      - MSG91_AUTHKEY
+      - MSG91_INTEGRATED_NUMBER
+      - MSG91_WHATSAPP_OUTBOUND_URL (optional; default control.msg91.com v5 outbound endpoint)
+    """
+    authkey = (os.getenv('MSG91_AUTHKEY') or '').strip()
+    integrated_number = (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip()
+    outbound_url = (os.getenv(
+        'MSG91_WHATSAPP_OUTBOUND_URL',
+        'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/',
+    ) or '').strip()
+
+    if not authkey:
+        raise ValueError('Missing MSG91_AUTHKEY in environment.')
+    if not integrated_number:
+        raise ValueError('Missing MSG91_INTEGRATED_NUMBER in environment.')
+    if not outbound_url:
+        raise ValueError('Missing MSG91_WHATSAPP_OUTBOUND_URL in environment.')
+    if not recipient_number:
+        raise ValueError('Missing recipient_number.')
+    if text is None:
+        text = ''
+
+    payload = {
+        'integrated_number': integrated_number,
+        'recipient_number': recipient_number,
+        'content_type': 'text',
+        'text': text,
+    }
+    data = json.dumps(payload).encode('utf-8')
+
+    req = urllib.request.Request(
+        outbound_url,
+        data=data,
+        headers={
+            'Authkey': authkey,
+            'accept': 'application/json',
+            'content-type': 'application/json',
+        },
+        method='POST',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {'raw': raw}
+    except urllib.error.HTTPError as e:
+        raw = ''
+        try:
+            raw = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            raw = str(e)
+        raise RuntimeError(f'Msg91 HTTPError: {e.code} {raw}')
+    except Exception as e:
+        raise RuntimeError(f'Msg91 request failed: {str(e)}')
+
+
+def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
+    """
+    Send WhatsApp outbound message using a pre-approved WhatsApp template (single body component).
+
+    This code assumes your template's body has exactly ONE dynamic variable, and MSG91 will map it to `body_1`.
+
+    Required env vars:
+      - MSG91_AUTHKEY
+      - MSG91_INTEGRATED_NUMBER
+      - MSG91_WHATSAPP_TEMPLATE_NAME
+      - MSG91_WHATSAPP_TEMPLATE_NAMESPACE
+      - MSG91_WHATSAPP_TEMPLATE_LANGUAGE_CODE (optional, default: en)
+    """
+    authkey = (os.getenv('MSG91_AUTHKEY') or '').strip()
+    integrated_number = (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip()
+    template_name = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip()
+    template_namespace = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAMESPACE') or '').strip()
+    template_lang = (os.getenv('MSG91_WHATSAPP_TEMPLATE_LANGUAGE_CODE') or 'en').strip()
+    outbound_url = (os.getenv(
+        'MSG91_WHATSAPP_TEMPLATE_OUTBOUND_URL',
+        'https://control.msg91.com/api/v5/whatsapp/whatsapp-outbound-message/bulk/',
+    ) or '').strip()
+
+    if not authkey:
+        raise ValueError('Missing MSG91_AUTHKEY in environment.')
+    if not integrated_number:
+        raise ValueError('Missing MSG91_INTEGRATED_NUMBER in environment.')
+    if not template_name:
+        raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_NAME in environment.')
+    if not template_namespace:
+        raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_NAMESPACE in environment.')
+    if not outbound_url:
+        raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_OUTBOUND_URL in environment.')
+    if not recipient_number:
+        raise ValueError('Missing recipient_number.')
+    if text is None:
+        text = ''
+
+    # We send the full rendered message as the single body parameter (body_1).
+    payload = {
+        'integrated_number': integrated_number,
+        'content_type': 'template',
+        'payload': {
+            'messaging_product': 'whatsapp',
+            'type': 'template',
+            'template': {
+                'name': template_name,
+                'language': {
+                    'code': template_lang,
+                    'policy': 'deterministic',
+                },
+                'namespace': template_namespace,
+                'to_and_components': [
+                    {
+                        'to': [recipient_number],
+                        'components': {
+                            'body_1': {
+                                'type': 'text',
+                                'value': text,
+                            }
+                        },
+                    }
+                ],
+            }
+        },
+    }
+
+    data = json.dumps(payload).encode('utf-8')
+
+    req = urllib.request.Request(
+        outbound_url,
+        data=data,
+        headers={
+            'Authkey': authkey,
+            'accept': 'application/json',
+            'content-type': 'application/json',
+        },
+        method='POST',
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {'raw': raw}
+    except urllib.error.HTTPError as e:
+        raw = ''
+        try:
+            raw = e.read().decode('utf-8', errors='replace')
+        except Exception:
+            raw = str(e)
+        raise RuntimeError(f'Msg91 HTTPError: {e.code} {raw}')
+    except Exception as e:
+        raise RuntimeError(f'Msg91 request failed: {str(e)}')
+
+
+def _msg91_send_whatsapp_message(recipient_number: str, text: str) -> dict:
+    """
+    Choose template-based sending if template env vars are configured,
+    otherwise fall back to text sending.
+    """
+    template_name = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip()
+    return (
+        _msg91_send_whatsapp_template(recipient_number, text)
+        if template_name
+        else _msg91_send_whatsapp_text(recipient_number, text)
+    )
+
 from .models import (
     Exam, Question, ExamQuestion, Participant,
-    ExamParticipant, ExamAttempt, Answer
+    ExamParticipant, ExamAttempt, Answer, School, UserProfile,
+    DailyAttendance,
+    ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN, ROLE_TEACHER,
+)
+from .permissions import (
+    scope_exams_queryset, scope_participants_queryset, scope_schools_queryset,
+    can_create_school_admin, can_create_teacher, get_user_school_id, get_user_role,
 )
 from .serializers import (
     UserSerializer, LoginSerializer, ExamSerializer, ExamCreateUpdateSerializer,
@@ -40,7 +229,7 @@ from .serializers import (
     ExamAttemptSerializer, QuestionAnalysisSerializer, ParticipantResultSerializer,
     ExamReportSerializer, DashboardStatsSerializer, RecentExamSerializer,
     PerformanceDataSerializer, DashboardDataSerializer, LeaderboardEntrySerializer,
-    LeaderboardSerializer
+    LeaderboardSerializer, SchoolSerializer, CreateSchoolAdminSerializer, CreateTeacherSerializer,
 )
 
 
@@ -67,7 +256,31 @@ class ExamViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return Exam.objects.filter(created_by=self.request.user).prefetch_related('exam_questions__question')
+        qs = Exam.objects.all().prefetch_related('exam_questions__question').select_related('school', 'created_by')
+        qs = scope_exams_queryset(qs, self.request.user)
+        role = get_user_role(self.request.user)
+        params = self.request.query_params
+        if role == ROLE_SUPER_ADMIN:
+            school_id = params.get('school_id')
+            if school_id is not None and school_id != '':
+                try:
+                    qs = qs.filter(school_id=int(school_id))
+                except (ValueError, TypeError):
+                    pass
+            owner_user_id = params.get('owner_user_id')
+            if owner_user_id is not None and owner_user_id != '':
+                try:
+                    qs = qs.filter(created_by_id=int(owner_user_id))
+                except (ValueError, TypeError):
+                    pass
+        elif role == ROLE_SCHOOL_ADMIN:
+            owner_user_id = params.get('owner_user_id')
+            if owner_user_id is not None and owner_user_id != '':
+                try:
+                    qs = qs.filter(created_by_id=int(owner_user_id))
+                except (ValueError, TypeError):
+                    pass
+        return qs
     
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
@@ -135,6 +348,9 @@ class ExamViewSet(viewsets.ModelViewSet):
             'description': exam.description,
             'duration': exam.duration,
             'revisable': exam.revisable,
+            'show_live_response': getattr(exam, 'show_live_response', False),
+            'show_response_after_completion': getattr(exam, 'show_response_after_completion', True),
+            'question_change_automatic': getattr(exam, 'question_change_automatic', False),
             'option_display': option_display,
             'frozen_at': timezone.now().isoformat(),
             'questions': []
@@ -182,14 +398,28 @@ class ExamViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def available_questions(self, request):
-        """Get available questions for selection (not already in exam)"""
+        """Get available questions for selection (not already in exam). Scoped by role."""
         exam_id = request.query_params.get('exam_id')
         difficulty = request.query_params.get('difficulty')
         qtype = request.query_params.get('type')
         search = request.query_params.get('search', '')
-        
-        queryset = Question.objects.all()
-        
+
+        # Scope by role: Super Admin all, School Admin same school, Teacher own only
+        user = request.user
+        role = get_user_role(user)
+        if role == ROLE_SUPER_ADMIN:
+            queryset = Question.objects.all()
+        elif role == ROLE_SCHOOL_ADMIN:
+            school_id = get_user_school_id(user)
+            if not school_id:
+                queryset = Question.objects.none()
+            else:
+                queryset = Question.objects.filter(created_by__profile__school_id=school_id)
+        elif role == ROLE_TEACHER:
+            queryset = Question.objects.filter(created_by=user)
+        else:
+            queryset = Question.objects.filter(created_by=user)
+
         # Filter by difficulty
         if difficulty and difficulty != 'all':
             queryset = queryset.filter(difficulty=difficulty)
@@ -222,6 +452,9 @@ class ExamViewSet(viewsets.ModelViewSet):
         if exam.snapshot_data:
             snapshot_data = exam.snapshot_data
             snapshot_data.setdefault('option_display', 'alpha')
+            snapshot_data.setdefault('show_live_response', False)
+            snapshot_data.setdefault('show_response_after_completion', True)
+            snapshot_data.setdefault('question_change_automatic', False)
         else:
             questions = exam.exam_questions.select_related('question').order_by('order')
             snapshot_data = {
@@ -230,6 +463,9 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'description': exam.description,
                 'duration': exam.duration,
                 'revisable': exam.revisable,
+                'show_live_response': getattr(exam, 'show_live_response', False),
+                'show_response_after_completion': getattr(exam, 'show_response_after_completion', True),
+            'question_change_automatic': getattr(exam, 'question_change_automatic', False),
                 'option_display': 'alpha',
                 'generated_at': timezone.now().isoformat(),
                 'questions': []
@@ -266,14 +502,19 @@ class ExamViewSet(viewsets.ModelViewSet):
         Submit live clicker responses and attendance from EasyTest Live app.
         Body: {
             "responses": [
-                {"participant_id": 1, "question_id": 2, "selected_answer": 0, "answered_at": "ISO8601"},
-                {"clicker_id": "123", ...}  // alternative: resolve participant by clicker_id
+                {"participant_id": 1, "question_id": 2, "selected_answer": 0,
+                 "answered_at": "ISO8601 (+05:30 IST ok)", "time_taken": 12},
+                {"clicker_id": "123", ...}  # alternative: resolve participant by clicker_id
             ],
-            "attendance": [1, 2, 3]  // optional: participant_ids to mark present
+            "attendance": [1, 2, 3]  # optional: participant_ids to mark present
         }
         selected_answer: 0-based index (MCQ) or list of indices (multiple_select). Letter "A"=0, "B"=1, etc.
         """
         exam = self.get_object()
+        # Debug: confirm endpoint is being hit and this terminal is receiving logs.
+        # Use print+flush so it shows even if logging config suppresses logger.*.
+        print(f"[sync_live_results] Endpoint hit for exam id={pk}", flush=True)
+        logger.warning('[sync_live_results] Endpoint hit for exam id=%s', pk)
         if exam.status not in ('frozen', 'completed'):
             logger.warning('[sync_live_results] Exam %s not frozen/completed, status=%s', pk, exam.status)
             return Response(
@@ -303,6 +544,36 @@ class ExamViewSet(viewsets.ModelViewSet):
             pk, len(responses_data), len(attendance_ids)
         )
 
+        def _parse_answered_at_for_sync(raw):
+            if not raw:
+                return None
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
+                if timezone.is_naive(dt):
+                    dt = timezone.make_aware(dt)
+                return dt
+            except (ValueError, TypeError):
+                return None
+
+        def _response_chronological_key(item):
+            dt = _parse_answered_at_for_sync(item.get('answered_at'))
+            pid = item.get('participant_id')
+            try:
+                pid_key = int(pid) if pid is not None else -1
+            except (TypeError, ValueError):
+                pid_key = -1
+            cid = str(item.get('clicker_id') or '')
+            ts = dt.timestamp() if dt else 0.0
+            qid = item.get('question_id')
+            try:
+                q_key = int(qid) if qid is not None else 0
+            except (TypeError, ValueError):
+                q_key = 0
+            return (pid_key, cid, ts, q_key)
+
+        responses_data = sorted(responses_data, key=_response_chronological_key)
+
         # Build snapshot question lookup (question_id -> correct_answer, positive_marks, negative_marks)
         snapshot = exam.snapshot_data or {}
         questions_list = snapshot.get('questions', [])
@@ -318,6 +589,32 @@ class ExamViewSet(viewsets.ModelViewSet):
                 }
 
         # Resolve participant by id or clicker_id; create one from clicker_id if missing (e.g. deviceId fallback when SDK keySN is empty)
+        # clicker_id is unique per exam author (teacher), not globally — scope lookups to this exam / exam.created_by.
+        def _participant_by_clicker_for_exam(clicker_id_str):
+            if not clicker_id_str:
+                return None
+            p = (
+                Participant.objects.filter(
+                    clicker_id=clicker_id_str,
+                    participant_exams__exam=exam,
+                )
+                .first()
+            )
+            if p:
+                return p
+            if exam.created_by_id:
+                p = (
+                    Participant.objects.filter(
+                        clicker_id=clicker_id_str,
+                        created_by_id=exam.created_by_id,
+                    )
+                    .first()
+                )
+                if p:
+                    return p
+            # Legacy / edge case: fall back to global match (e.g. old rows without created_by)
+            return Participant.objects.filter(clicker_id=clicker_id_str).first()
+
         def get_or_create_participant_for_clicker(participant_id=None, clicker_id=None):
             if participant_id:
                 try:
@@ -330,31 +627,39 @@ class ExamViewSet(viewsets.ModelViewSet):
                 clicker_id_str = str(clicker_id).strip()
                 if not clicker_id_str:
                     return None
-                try:
-                    p = Participant.objects.get(clicker_id=clicker_id_str)
-                    if ExamParticipant.objects.filter(exam=exam, participant=p).exists():
-                        return p
+                p = _participant_by_clicker_for_exam(clicker_id_str)
+                if p:
                     ExamParticipant.objects.get_or_create(exam=exam, participant=p)
                     return p
-                except Participant.DoesNotExist:
-                    pass
                 # When app sends deviceId fallback (d1_timestamp) because SDK keySN is empty, match to participant with clicker_id = number (e.g. "1")
                 if clicker_id_str.startswith('d') and '_' in clicker_id_str:
                     num_part = clicker_id_str[1:].split('_')[0]
                     if num_part.isdigit():
-                        try:
-                            p = Participant.objects.get(clicker_id=num_part)
+                        p = _participant_by_clicker_for_exam(num_part)
+                        if p:
                             ExamParticipant.objects.get_or_create(exam=exam, participant=p)
                             return p
-                        except Participant.DoesNotExist:
-                            pass
                 # Auto-create participant only if no match (e.g. when SDK sends empty keySN and no participant has that clicker number)
                 safe_id = ''.join(c if c.isalnum() or c in '_-' else '_' for c in clicker_id_str)[:50]
-                email = f'clicker-{safe_id}@easytest.local'
-                p, created = Participant.objects.get_or_create(
-                    clicker_id=clicker_id_str,
-                    defaults={'name': 'Student', 'email': email}
-                )
+                uid = exam.created_by_id or 0
+                email = f'clicker-e{exam.id}-u{uid}-{safe_id}@easytest.local'
+                defaults = {
+                    'name': 'Student',
+                    'email': email,
+                }
+                if exam.school_id:
+                    defaults['school_id'] = exam.school_id
+                if exam.created_by_id:
+                    p, created = Participant.objects.get_or_create(
+                        clicker_id=clicker_id_str,
+                        created_by_id=exam.created_by_id,
+                        defaults=defaults,
+                    )
+                else:
+                    p, created = Participant.objects.get_or_create(
+                        clicker_id=clicker_id_str,
+                        defaults=defaults,
+                    )
                 if created:
                     logger.info('[sync_live_results] Auto-created participant id=%s clicker_id=%s for exam %s', p.id, clicker_id_str, pk)
                 ExamParticipant.objects.get_or_create(exam=exam, participant=p)
@@ -437,30 +742,36 @@ class ExamViewSet(viewsets.ModelViewSet):
             correct = is_correct(qinfo, selected)
             pos = float(qinfo.get('positive_marks', 1))
             neg = float(qinfo.get('negative_marks', 0))
+            answered_dt = _parse_answered_at_for_sync(item.get('answered_at'))
             time_taken = 0
-            if item.get('answered_at') and attempt.started_at:
+            used_client_time = False
+            if 'time_taken' in item:
                 try:
-                    raw = item['answered_at']
-                    if isinstance(raw, str):
-                        from datetime import datetime
-                        answered = datetime.fromisoformat(raw.replace('Z', '+00:00'))
-                        if timezone.is_naive(answered):
-                            answered = timezone.make_aware(answered)
-                    else:
-                        answered = raw
-                    # Per-question time: delta from previous answer (or exam start for first answer)
+                    time_taken = max(0, int(item.get('time_taken')))
+                    used_client_time = True
+                except (TypeError, ValueError):
+                    used_client_time = False
+            if used_client_time:
+                logger.info(
+                    '[sync_live_results] TIME_TAKEN DEBUG: question_id=%s participant_id=%s '
+                    'time_taken(sec)=%s from client; answered_at=%s',
+                    question_id, participant.id, time_taken, item.get('answered_at'),
+                )
+            elif answered_dt and attempt.started_at:
+                try:
+                    # Legacy: per-question time from timestamps — delta from previous answer or exam start.
                     prev = (
-                        Answer.objects.filter(attempt=attempt, answered_at__lt=answered)
+                        Answer.objects.filter(attempt=attempt, answered_at__lt=answered_dt)
                         .order_by('-answered_at')
                         .values_list('answered_at', flat=True)
                         .first()
                     )
                     base = prev if prev else attempt.started_at
-                    time_taken = max(0, int((answered - base).total_seconds()))
+                    time_taken = max(0, int((answered_dt - base).total_seconds()))
                     logger.info(
                         '[sync_live_results] TIME_TAKEN DEBUG: question_id=%s participant_id=%s '
-                        'base=%s answered_at=%s -> time_taken(sec)=%s',
-                        question_id, participant.id, base, raw, time_taken
+                        'base=%s answered_at=%s -> time_taken(sec)=%s (computed)',
+                        question_id, participant.id, base, item.get('answered_at'), time_taken
                     )
                 except Exception as e:
                     logger.warning('[sync_live_results] TIME_TAKEN DEBUG: failed to compute time_taken: %s', e)
@@ -472,13 +783,18 @@ class ExamViewSet(viewsets.ModelViewSet):
                         question_id, item.get('answered_at'), getattr(attempt, 'started_at', None)
                     )
 
+            answer_at_to_store = answered_dt if answered_dt else timezone.now()
+
             existing = Answer.objects.filter(attempt=attempt, question_id=question_id).first()
             if existing:
                 if exam.revisable:
                     existing.selected_answer = selected if isinstance(selected, list) else [selected]
                     existing.is_correct = correct
                     existing.time_taken = time_taken
-                    existing.save()
+                    existing.answered_at = answer_at_to_store
+                    existing.save(
+                        update_fields=['selected_answer', 'is_correct', 'time_taken', 'answered_at']
+                    )
                     answers_updated += 1
                 else:
                     skipped_already_answered += 1
@@ -489,7 +805,8 @@ class ExamViewSet(viewsets.ModelViewSet):
                 question_id=question_id,
                 selected_answer=selected if isinstance(selected, list) else [selected],
                 is_correct=correct,
-                time_taken=time_taken
+                time_taken=time_taken,
+                answered_at=answer_at_to_store,
             )
             answers_created += 1
 
@@ -515,9 +832,8 @@ class ExamViewSet(viewsets.ModelViewSet):
             attempt.score = total_marks
             attempt.submitted_at = timezone.now()
             if answers.exists():
-                last_ans = answers.order_by('-answered_at').first()
-                if last_ans and attempt.started_at:
-                    attempt.time_taken = max(0, int((last_ans.answered_at - attempt.started_at).total_seconds()))
+                # Sum per-question seconds so leaderboard / exports match "Speed" column totals.
+                attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
             attempt.save()
 
         # Assign all listed participants to the exam and mark present those who responded
@@ -562,10 +878,19 @@ class ExamViewSet(viewsets.ModelViewSet):
         participants = []
         for ep in assigned:
             p = ep.participant
+            extra = p.extra or {}
             participants.append({
                 'id': p.id,
                 'name': p.name,
                 'email': p.email,
+                'clicker_id': p.clicker_id,
+                'parent_email_id': extra.get('parent_email_id', '') if isinstance(extra, dict) else '',
+                'parent_whatsapp': (
+                    extra.get('parent_whatsapp')
+                    or extra.get('parent_phone')
+                    or extra.get('parent_mobile')
+                    or ''
+                ) if isinstance(extra, dict) else '',
                 'present': p.id in present_ids,
             })
         present_count = len(present_ids)
@@ -578,12 +903,863 @@ class ExamViewSet(viewsets.ModelViewSet):
             'total_count': total_count,
         })
 
+    @action(detail=True, methods=['get'], url_path='attendance/export')
+    def attendance_export(self, request, pk=None):
+        """
+        GET /api/exams/{id}/attendance/export/?format=excel|pdf
+        Downloads Attendance report as Excel or PDF.
+        """
+        exam = self.get_object()
+        # IMPORTANT: DRF uses `?format=` for content negotiation; using it breaks this endpoint.
+        # Use `file_format` instead (keep `format` as fallback for older clients).
+        raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
+        format_type = 'pdf' if raw in ('pdf',) else 'excel'
+
+        assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
+        present_ids = set(ExamAttempt.objects.filter(exam=exam).values_list('participant_id', flat=True))
+
+        rows = []
+        for ep in assigned:
+            p = ep.participant
+            extra = p.extra or {}
+            status_label = 'Present' if p.id in present_ids else 'Absent'
+            rows.append({
+                'Name': p.name,
+                'Keypad ID': p.clicker_id,
+                'Email': p.email or '',
+                'Parent Email ID': extra.get('parent_email_id', '') if isinstance(extra, dict) else '',
+                'Parent WhatsApp': (
+                    extra.get('parent_whatsapp')
+                    or extra.get('parent_phone')
+                    or extra.get('parent_mobile')
+                    or ''
+                ) if isinstance(extra, dict) else '',
+                'Status': status_label,
+            })
+
+        filename_base = f'attendance-{exam.id}'
+        if format_type == 'excel':
+            output = BytesIO()
+            df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status'])
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Attendance', index=False)
+            output.seek(0)
+            response = HttpResponse(output.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            response['Content-Disposition'] = f'attachment; filename="{filename_base}.xlsx"'
+            return response
+
+        # PDF
+        output = BytesIO()
+        doc = SimpleDocTemplate(output, pagesize=A4)
+        styles = getSampleStyleSheet()
+        elements = [
+            Paragraph(f'Attendance Report - {exam.title}', styles['Title']),
+            Spacer(1, 12),
+            Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
+            Spacer(1, 12),
+        ]
+
+        table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status']] + [
+            [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Parent WhatsApp'], r['Status']] for r in rows
+        ]
+        table = Table(table_data, repeatRows=1, hAlign='LEFT')
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+            ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 8),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ]))
+        elements.append(table)
+        doc.build(elements)
+        output.seek(0)
+
+        response = HttpResponse(output.getvalue(), content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="{filename_base}.pdf"'
+        return response
+
+    @action(detail=True, methods=['post'], url_path='attendance/send-parent-emails')
+    def send_parent_emails(self, request, pk=None):
+        """
+        POST /api/exams/{id}/attendance/send-parent-emails/
+        Body:
+          {
+            "scope": "present" | "absent" | "all",
+            "subject": "...",
+            "body": ".... {{exam_title}} {{student_name}} {{clicker_id}} {{status}} ..."
+          }
+        Sends emails to Participant.extra.parent_email_id for assigned participants.
+        """
+        exam = self.get_object()
+        scope = (request.data.get('scope') or 'absent').strip().lower()
+        participant_ids = request.data.get('participant_ids', None)
+        subject = (request.data.get('subject') or '').strip()
+        body = (request.data.get('body') or '').strip()
+        if scope not in ('present', 'absent', 'all'):
+            return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+        if participant_ids is not None and not isinstance(participant_ids, list):
+            return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+        if not subject:
+            return Response({'error': 'Subject is required'}, status=status.HTTP_400_BAD_REQUEST)
+        if not body:
+            return Response({'error': 'Body is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
+        if participant_ids:
+            try:
+                ids = [int(x) for x in participant_ids]
+            except Exception:
+                return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+            assigned = assigned.filter(participant_id__in=ids)
+        present_ids = set(ExamAttempt.objects.filter(exam=exam).values_list('participant_id', flat=True))
+
+        sent = 0
+        skipped = 0
+        errors = []
+
+        # Reuse a single SMTP connection for all recipients.
+        # This avoids long repeated reconnects and helps prevent gunicorn worker timeouts.
+        connection = get_connection(fail_silently=False)
+        try:
+            connection.open()
+        except Exception as e:
+            # Network/SMTP connectivity failure (e.g., no internet, firewall blocking).
+            # Return a normal JSON response so the UI can show the exact error.
+            return Response({'sent': 0, 'skipped': 0, 'errors': [str(e)]}, status=status.HTTP_200_OK)
+
+        def _render(template: str, ctx: dict) -> str:
+            out = template
+            for k, v in ctx.items():
+                out = out.replace('{{' + k + '}}', str(v))
+            return out
+
+        try:
+            for ep in assigned:
+                p = ep.participant
+                is_present = p.id in present_ids
+                if scope == 'present' and not is_present:
+                    continue
+                if scope == 'absent' and is_present:
+                    continue
+
+                extra = p.extra or {}
+                parent_email = extra.get('parent_email_id') if isinstance(extra, dict) else None
+                parent_email = (parent_email or '').strip()
+                if not parent_email:
+                    skipped += 1
+                    continue
+
+                ctx = {
+                    'exam_title': exam.title,
+                    'student_name': p.name,
+                    'clicker_id': p.clicker_id,
+                    'status': 'Present' if is_present else 'Absent',
+                }
+                msg = EmailMessage(
+                    subject=_render(subject, ctx),
+                    body=_render(body, ctx),
+                    to=[parent_email],
+                    connection=connection,
+                )
+                try:
+                    msg.send(fail_silently=False)
+                    sent += 1
+                except Exception as e:
+                    errors.append(f'Participant {p.id}: {str(e)}')
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+        return Response({'sent': sent, 'skipped': skipped, 'errors': errors})
+
+    @action(detail=True, methods=['post'], url_path='attendance/send-parent-whatsapp')
+    def send_parent_whatsapp(self, request, pk=None):
+        """
+        POST /api/exams/{id}/attendance/send-parent-whatsapp/
+        Body:
+          {
+            "scope": "present" | "absent" | "all",
+            "message": ".... {{exam_title}} {{student_name}} {{clicker_id}} {{status}} ...",
+            "participant_ids": [1, 2, 3]  // optional
+          }
+        Sends WhatsApp messages via msg91 outbound API for selected participants.
+        """
+        exam = self.get_object()
+        scope = (request.data.get('scope') or 'absent').strip().lower()
+        participant_ids = request.data.get('participant_ids', None)
+        message = (request.data.get('message') or '').strip()
+        if scope not in ('present', 'absent', 'all'):
+            return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+        if participant_ids is not None and not isinstance(participant_ids, list):
+            return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+        if not message:
+            return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Fail fast if msg91 is not configured
+        if not (os.getenv('MSG91_AUTHKEY') or '').strip() or not (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip():
+            return Response(
+                {
+                    'error': 'Msg91 WhatsApp is not configured. Set MSG91_AUTHKEY and MSG91_INTEGRATED_NUMBER in backend env.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # If template mode is enabled (template name set), ensure required template env vars exist.
+        if (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip() and not (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAMESPACE') or '').strip():
+            return Response(
+                {
+                    'error': 'Msg91 WhatsApp template is not configured. Set MSG91_WHATSAPP_TEMPLATE_NAMESPACE when MSG91_WHATSAPP_TEMPLATE_NAME is set.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        assigned = ExamParticipant.objects.filter(exam=exam).select_related('participant')
+        if participant_ids:
+            try:
+                ids = [int(x) for x in participant_ids]
+            except Exception:
+                return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+            assigned = assigned.filter(participant_id__in=ids)
+        present_ids = set(ExamAttempt.objects.filter(exam=exam).values_list('participant_id', flat=True))
+
+        sent = 0
+        skipped = 0
+        errors = []
+        messages = []
+
+        def _render(template: str, ctx: dict) -> str:
+            out = template
+            for k, v in ctx.items():
+                out = out.replace('{{' + k + '}}', str(v))
+            return out
+
+        def _normalize_phone(raw: str) -> str:
+            # WhatsApp wa.me expects digits only (country code included).
+            return ''.join(ch for ch in str(raw or '') if ch.isdigit())
+
+        for ep in assigned:
+            p = ep.participant
+            is_present = p.id in present_ids
+            if scope == 'present' and not is_present:
+                continue
+            if scope == 'absent' and is_present:
+                continue
+
+            extra = p.extra or {}
+            parent_phone = None
+            if isinstance(extra, dict):
+                parent_phone = (
+                    extra.get('parent_whatsapp')
+                    or extra.get('parent_phone')
+                    or extra.get('parent_mobile')
+                )
+            phone = _normalize_phone(parent_phone)
+            if not phone:
+                skipped += 1
+                continue
+
+            ctx = {
+                'exam_title': exam.title,
+                'student_name': p.name,
+                'clicker_id': p.clicker_id,
+                'status': 'Present' if is_present else 'Absent',
+            }
+            try:
+                text = _render(message, ctx)
+                resp = _msg91_send_whatsapp_message(phone, text)
+                msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
+                messages.append({
+                    'participant_id': p.id,
+                    'student_name': p.name,
+                    'phone': phone,
+                    'message_id': msg_id,
+                })
+                sent += 1
+            except Exception as e:
+                errors.append(f'Participant {p.id}: {str(e)}')
+
+        return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'messages': messages})
+
+
+def _parse_iso_date(date_str):
+    if not date_str or not isinstance(date_str, str):
+        return None
+    try:
+        from datetime import datetime
+        return datetime.strptime(date_str.strip(), '%Y-%m-%d').date()
+    except ValueError:
+        return None
+
+
+def _daily_att_extra_row(p):
+    extra = p.extra or {}
+    if not isinstance(extra, dict):
+        extra = {}
+    return {
+        'parent_email_id': extra.get('parent_email_id', '') or '',
+        'parent_whatsapp': (
+            extra.get('parent_whatsapp')
+            or extra.get('parent_phone')
+            or extra.get('parent_mobile')
+            or ''
+        ),
+    }
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_summary(request):
+    """List day-wise attendance stats for the last N calendar days (sidebar)."""
+    from datetime import timedelta
+    from collections import defaultdict
+
+    try:
+        days = int(request.query_params.get('days') or 60)
+    except (TypeError, ValueError):
+        days = 60
+    days = max(1, min(days, 400))
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    total = pqs.count()
+    pid_list = list(pqs.values_list('id', flat=True))
+    today = timezone.localdate()
+    start = today - timedelta(days=days - 1)
+
+    counts_by_date = defaultdict(lambda: {'present': 0, 'absent': 0})
+    if pid_list:
+        for row in DailyAttendance.objects.filter(
+            participant_id__in=pid_list, date__gte=start, date__lte=today
+        ).values('date', 'present'):
+            d = row['date']
+            if row['present']:
+                counts_by_date[d]['present'] += 1
+            else:
+                counts_by_date[d]['absent'] += 1
+
+    out = []
+    for i in range(days):
+        d = today - timedelta(days=i)
+        c = counts_by_date[d]
+        pr, ab = c['present'], c['absent']
+        marked = pr + ab
+        out.append({
+            'date': d.isoformat(),
+            'present_count': pr,
+            'absent_count': ab,
+            'unmarked_count': max(0, total - marked),
+            'total_count': total,
+        })
+    return Response(out)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_day(request):
+    """Roster for one day: all scoped participants with daily mark (if any)."""
+    d = _parse_iso_date(request.query_params.get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    pids = list(pqs.values_list('id', flat=True))
+    records = {}
+    if pids:
+        records = {
+            r.participant_id: r
+            for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids)
+        }
+
+    participants = []
+    present_n = absent_n = unmarked_n = 0
+    for p in pqs:
+        rec = records.get(p.id)
+        marked = rec is not None
+        present = bool(rec.present) if rec else False
+        if not marked:
+            unmarked_n += 1
+        elif present:
+            present_n += 1
+        else:
+            absent_n += 1
+        ex = _daily_att_extra_row(p)
+        participants.append({
+            'id': p.id,
+            'name': p.name,
+            'email': p.email or '',
+            'clicker_id': p.clicker_id,
+            'parent_email_id': ex['parent_email_id'],
+            'parent_whatsapp': ex['parent_whatsapp'],
+            'present': present,
+            'marked': marked,
+        })
+
+    return Response({
+        'date': d.isoformat(),
+        'participants': participants,
+        'present_count': present_n,
+        'absent_count': absent_n,
+        'unmarked_count': unmarked_n,
+        'total_count': len(participants),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_save(request):
+    """Save attendance for a day.
+
+    Body: { \"date\": \"YYYY-MM-DD\", \"entries\": [{\"participant_id\": 1, \"status\": \"present\"|\"absent\"|\"unmarked\"}, ...] }
+    Legacy: { \"participant_id\", \"present\": true/false } treats false as absent and true as present.
+    """
+    d = _parse_iso_date((request.data or {}).get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+    entries = (request.data or {}).get('entries')
+    if not isinstance(entries, list) or not entries:
+        return Response({'error': 'entries must be a non-empty list.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    allowed_ids = set(
+        scope_participants_queryset(Participant.objects.all(), user).values_list('id', flat=True)
+    )
+    saved = 0
+    errors = []
+    for item in entries:
+        if not isinstance(item, dict):
+            errors.append('Invalid entry')
+            continue
+        try:
+            pid = int(item.get('participant_id'))
+        except (TypeError, ValueError):
+            errors.append('Invalid participant_id')
+            continue
+        if pid not in allowed_ids:
+            errors.append(f'Participant {pid} not in scope')
+            continue
+
+        status_val = item.get('status')
+        if status_val is None and 'present' in item:
+            status_val = 'present' if bool(item.get('present')) else 'absent'
+        status_val = (str(status_val or '')).strip().lower()
+        if status_val == 'unmarked':
+            DailyAttendance.objects.filter(participant_id=pid, date=d).delete()
+            saved += 1
+            continue
+        if status_val in ('present', 'absent'):
+            DailyAttendance.objects.update_or_create(
+                participant_id=pid,
+                date=d,
+                defaults={'present': status_val == 'present', 'recorded_by': user},
+            )
+            saved += 1
+        else:
+            errors.append(f'Participant {pid}: invalid status')
+    return Response({'saved': saved, 'errors': errors})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_export(request):
+    """GET /api/attendance/day/export/?date=YYYY-MM-DD&file_format=excel|pdf"""
+    d = _parse_iso_date(request.query_params.get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    pids = list(pqs.values_list('id', flat=True))
+    records = {}
+    if pids:
+        records = {
+            r.participant_id: r
+            for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids)
+        }
+
+    rows = []
+    for p in pqs:
+        rec = records.get(p.id)
+        ex = _daily_att_extra_row(p)
+        if rec is None:
+            status_label = 'Not recorded'
+        else:
+            status_label = 'Present' if rec.present else 'Absent'
+        rows.append({
+            'Name': p.name,
+            'Keypad ID': p.clicker_id,
+            'Email': p.email or '',
+            'Parent Email ID': ex['parent_email_id'],
+            'Parent WhatsApp': ex['parent_whatsapp'],
+            'Status': status_label,
+        })
+
+    raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
+    format_type = 'pdf' if raw in ('pdf',) else 'excel'
+    filename_base = f'attendance-daily-{d.isoformat()}'
+
+    if format_type == 'excel':
+        output = BytesIO()
+        df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status'])
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Attendance', index=False)
+        output.seek(0)
+        response = HttpResponse(
+            output.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename_base}.xlsx"'
+        return response
+
+    output = BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=A4)
+    styles = getSampleStyleSheet()
+    title = f'Daily Attendance — {d.strftime("%d/%m/%Y")}'
+    elements = [
+        Paragraph(title, styles['Title']),
+        Spacer(1, 12),
+        Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
+        Spacer(1, 12),
+    ]
+    table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status']] + [
+        [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Parent WhatsApp'], r['Status']] for r in rows
+    ]
+    table = Table(table_data, repeatRows=1, hAlign='LEFT')
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(table)
+    doc.build(elements)
+    output.seek(0)
+    response = HttpResponse(output.getvalue(), content_type='application/pdf')
+    response['Content-Disposition'] = f'attachment; filename="{filename_base}.pdf"'
+    return response
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_send_parent_emails(request):
+    """Same body as exam attendance emails; uses daily marks for `date`."""
+    d = _parse_iso_date((request.data or {}).get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    scope = ((request.data or {}).get('scope') or 'absent').strip().lower()
+    participant_ids = (request.data or {}).get('participant_ids', None)
+    subject = ((request.data or {}).get('subject') or '').strip()
+    body = ((request.data or {}).get('body') or '').strip()
+    if scope not in ('present', 'absent', 'all', 'unmarked'):
+        return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+    if participant_ids is not None and not isinstance(participant_ids, list):
+        return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+    if not subject:
+        return Response({'error': 'Subject is required'}, status=status.HTTP_400_BAD_REQUEST)
+    if not body:
+        return Response({'error': 'Body is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    if participant_ids:
+        try:
+            ids = [int(x) for x in participant_ids]
+        except Exception:
+            return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+        pqs = pqs.filter(id__in=ids)
+
+    pids = list(pqs.values_list('id', flat=True))
+    present_ids = set()
+    marked_ids = set()
+    if pids:
+        for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids).values(
+            'participant_id', 'present'
+        ):
+            marked_ids.add(r['participant_id'])
+            if r['present']:
+                present_ids.add(r['participant_id'])
+
+    attendance_date_label = d.strftime('%d/%m/%Y')
+    sent = 0
+    skipped = 0
+    errors = []
+    connection = get_connection(fail_silently=False)
+    try:
+        connection.open()
+    except Exception as e:
+        return Response({'sent': 0, 'skipped': 0, 'errors': [str(e)]}, status=status.HTTP_200_OK)
+
+    def _render(template: str, ctx: dict) -> str:
+        out = template
+        for k, v in ctx.items():
+            out = out.replace('{{' + k + '}}', str(v))
+        return out
+
+    try:
+        for p in pqs:
+            is_marked = p.id in marked_ids
+            is_present = p.id in present_ids
+            if scope == 'unmarked' and is_marked:
+                continue
+            if scope == 'present' and (not is_marked or not is_present):
+                continue
+            if scope == 'absent' and (not is_marked or is_present):
+                continue
+
+            extra = _daily_att_extra_row(p)
+            parent_email = (extra.get('parent_email_id') or '').strip()
+            if not parent_email:
+                skipped += 1
+                continue
+            status_human = 'Present' if is_present else ('Absent' if is_marked else 'Not recorded')
+            ctx = {
+                'exam_title': '',
+                'attendance_date': attendance_date_label,
+                'student_name': p.name,
+                'clicker_id': p.clicker_id,
+                'status': status_human,
+            }
+            msg = EmailMessage(
+                subject=_render(subject, ctx),
+                body=_render(body, ctx),
+                to=[parent_email],
+                connection=connection,
+            )
+            try:
+                msg.send(fail_silently=False)
+                sent += 1
+            except Exception as e:
+                errors.append(f'Participant {p.id}: {str(e)}')
+    finally:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+    return Response({'sent': sent, 'skipped': skipped, 'errors': errors})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def daily_attendance_send_parent_whatsapp(request):
+    d = _parse_iso_date((request.data or {}).get('date'))
+    if not d:
+        return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+
+    scope = ((request.data or {}).get('scope') or 'absent').strip().lower()
+    participant_ids = (request.data or {}).get('participant_ids', None)
+    message = ((request.data or {}).get('message') or '').strip()
+    if scope not in ('present', 'absent', 'all', 'unmarked'):
+        return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
+    if participant_ids is not None and not isinstance(participant_ids, list):
+        return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+    if not message:
+        return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Fail fast if msg91 is not configured
+    if not (os.getenv('MSG91_AUTHKEY') or '').strip() or not (os.getenv('MSG91_INTEGRATED_NUMBER') or '').strip():
+        return Response(
+            {
+                'error': 'Msg91 WhatsApp is not configured. Set MSG91_AUTHKEY and MSG91_INTEGRATED_NUMBER in backend env.',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    # If template mode is enabled, ensure required template env vars exist.
+    if (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip() and not (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAMESPACE') or '').strip():
+        return Response(
+            {
+                'error': 'Msg91 WhatsApp template is not configured. Set MSG91_WHATSAPP_TEMPLATE_NAMESPACE when MSG91_WHATSAPP_TEMPLATE_NAME is set.',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    user = request.user
+    pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
+        Length('clicker_id'), 'clicker_id'
+    )
+    if participant_ids:
+        try:
+            ids = [int(x) for x in participant_ids]
+        except Exception:
+            return Response({'error': 'participant_ids must be integers'}, status=status.HTTP_400_BAD_REQUEST)
+        pqs = pqs.filter(id__in=ids)
+
+    pids = list(pqs.values_list('id', flat=True))
+    present_ids = set()
+    marked_ids = set()
+    if pids:
+        for r in DailyAttendance.objects.filter(date=d, participant_id__in=pids).values('participant_id', 'present'):
+            marked_ids.add(r['participant_id'])
+            if r['present']:
+                present_ids.add(r['participant_id'])
+
+    attendance_date_label = d.strftime('%d/%m/%Y')
+    sent = 0
+    skipped = 0
+    errors = []
+    messages = []
+
+    def _render(template: str, ctx: dict) -> str:
+        out = template
+        for k, v in ctx.items():
+            out = out.replace('{{' + k + '}}', str(v))
+        return out
+
+    def _normalize_phone(raw: str) -> str:
+        return ''.join(ch for ch in str(raw or '') if ch.isdigit())
+
+    for p in pqs:
+        is_marked = p.id in marked_ids
+        is_present = p.id in present_ids
+        if scope == 'unmarked' and is_marked:
+            continue
+        if scope == 'present' and (not is_marked or not is_present):
+            continue
+        if scope == 'absent' and (not is_marked or is_present):
+            continue
+
+        extra = _daily_att_extra_row(p)
+        phone = _normalize_phone(extra.get('parent_whatsapp'))
+        if not phone:
+            skipped += 1
+            continue
+        status_human = 'Present' if is_present else ('Absent' if is_marked else 'Not recorded')
+        ctx = {
+            'exam_title': '',
+            'attendance_date': attendance_date_label,
+            'student_name': p.name,
+            'clicker_id': p.clicker_id,
+            'status': status_human,
+        }
+        try:
+            text = _render(message, ctx)
+            resp = _msg91_send_whatsapp_message(phone, text)
+            msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
+            messages.append({
+                'participant_id': p.id,
+                'student_name': p.name,
+                'phone': phone,
+                'message_id': msg_id,
+            })
+            sent += 1
+        except Exception as e:
+            errors.append(f'Participant {p.id}: {str(e)}')
+
+    return Response({'sent': sent, 'skipped': skipped, 'errors': errors, 'messages': messages})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def upload_question_media(request):
+    """Upload image or video for question rich text (stored under MEDIA_ROOT). Returns JSON { url }."""
+    from django.core.files.storage import default_storage
+
+    uploaded = request.FILES.get('file')
+    if not uploaded:
+        return Response({'detail': 'No file provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    orig = (uploaded.name or 'file').strip()
+    ext = os.path.splitext(orig)[1].lower()
+    if not ext:
+        return Response({'detail': 'File must have an extension.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    allowed_img = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+    allowed_vid = {'.mp4', '.webm', '.ogg', '.mov', '.m4v'}
+    is_img = ext in allowed_img
+    is_vid = ext in allowed_vid
+    if not is_img and not is_vid:
+        return Response(
+            {
+                'detail': f'Unsupported file type. Images: {sorted(allowed_img)}. Video: {sorted(allowed_vid)}.',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    max_image = 15 * 1024 * 1024
+    max_video = 120 * 1024 * 1024
+    max_bytes = max_image if is_img else max_video
+    if uploaded.size > max_bytes:
+        return Response({'detail': 'File too large.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    sub = 'images' if is_img else 'videos'
+    key = f'question_media/{sub}/{uuid.uuid4().hex}{ext}'
+    saved_name = default_storage.save(key, uploaded)
+    relative = default_storage.url(saved_name)
+    full_url = request.build_absolute_uri(relative)
+    return Response({'url': full_url})
+
 
 # Question Views
 class QuestionViewSet(viewsets.ModelViewSet):
-    queryset = Question.objects.all()
     serializer_class = QuestionSerializer
     permission_classes = [IsAuthenticated]
+
+    def perform_create(self, serializer):
+        """Set created_by when a question is created manually."""
+        serializer.save(created_by=self.request.user)
+
+    def get_queryset(self):
+        """Scope questions by role.
+
+        - Super Admin: all questions
+        - School Admin: questions created by users in their school
+        - Teacher: only questions they created
+        """
+        qs = Question.objects.all()
+        user = self.request.user
+        role = get_user_role(user)
+        params = self.request.query_params
+
+        def _parse_int(raw):
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+
+        school_id_param = _parse_int(params.get('school_id'))
+        teacher_id_param = _parse_int(params.get('teacher_id') or params.get('created_by'))
+
+        # RBAC scope first
+        if role == ROLE_SUPER_ADMIN:
+            # optional filter for super admin
+            if school_id_param is not None:
+                qs = qs.filter(created_by__profile__school_id=school_id_param)
+            if teacher_id_param is not None:
+                qs = qs.filter(created_by_id=teacher_id_param)
+            return qs
+
+        if role == ROLE_SCHOOL_ADMIN:
+            user_school_id = get_user_school_id(user)
+            if not user_school_id:
+                return qs.none()
+            qs = qs.filter(created_by__profile__school_id=user_school_id)
+            # allow further narrowing
+            if school_id_param is not None and school_id_param != user_school_id:
+                return qs.none()
+            if teacher_id_param is not None:
+                qs = qs.filter(created_by_id=teacher_id_param)
+            return qs
+
+        if role == ROLE_TEACHER:
+            # teacher can only see their own questions; if they ask for another teacher, return none
+            if teacher_id_param is not None and teacher_id_param != user.id:
+                return qs.none()
+            return qs.filter(created_by=user)
+
+        return qs.none()
 
     def _normalize_topic(self, raw: str) -> str:
         """Ensure topic is a short label, not a full prompt (e.g. from mis-sent request)."""
@@ -719,7 +1895,8 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         option_display=option_display,
                         difficulty=q_data.get('difficulty', difficulty),
                         tags=q_data.get('tags', [topic]),
-                        marks=q_data.get('marks', 1.0)
+                        marks=q_data.get('marks', 1.0),
+                        created_by=request.user,
                     )
                     generated_questions.append(QuestionSerializer(question).data)
                 
@@ -944,21 +2121,50 @@ class ParticipantViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         exam_id = self.request.query_params.get('exam_id')
+        school_id_param = self.request.query_params.get('school_id')
+        teacher_id_param = (
+            self.request.query_params.get('teacher_id')
+            or self.request.query_params.get('created_by')
+        )
         user = self.request.user
-        # Order by clicker_id in natural order: 1, 2, ... 9, 10, 11, then alphanumeric (P007, S008, etc.)
         base_order = [Length('clicker_id'), 'clicker_id']
-        if exam_id:
-            # Only return participants for exams owned by current user
+        base_qs = scope_participants_queryset(Participant.objects.all(), user)
+        role = get_user_role(user)
+        if school_id_param not in (None, ''):
             try:
-                exam = Exam.objects.get(id=exam_id, created_by=user)
+                sid = int(school_id_param)
+            except (TypeError, ValueError):
+                sid = None
+            if sid is not None:
+                if role == ROLE_SCHOOL_ADMIN:
+                    user_school = get_user_school_id(user)
+                    if user_school is not None and sid != user_school:
+                        base_qs = base_qs.none()
+                    else:
+                        base_qs = base_qs.filter(school_id=sid)
+                else:
+                    base_qs = base_qs.filter(school_id=sid)
+        if teacher_id_param not in (None, ''):
+            try:
+                tid = int(teacher_id_param)
+            except (TypeError, ValueError):
+                tid = None
+            if tid is not None:
+                base_qs = base_qs.filter(created_by_id=tid)
+        if exam_id:
+            exam_qs = scope_exams_queryset(Exam.objects.all(), user)
+            try:
+                exam = exam_qs.get(id=exam_id)
             except Exam.DoesNotExist:
                 return Participant.objects.none()
             participant_ids = ExamParticipant.objects.filter(exam=exam).values_list('participant_id', flat=True)
-            return Participant.objects.filter(id__in=participant_ids).order_by(*base_order)
-        # No exam_id (e.g. /participants/ page): return all participants so the list
-        # shows every participant and which clicker_id is assigned (avoids "clicker id
-        # already assigned" when the assigning participant is not in the filtered list).
-        return Participant.objects.all().order_by(*base_order)
+            return base_qs.filter(id__in=participant_ids).order_by(*base_order)
+        return base_qs.order_by(*base_order)
+
+    def perform_create(self, serializer):
+        """Set created_by and school on single participant create."""
+        school_id = get_user_school_id(self.request.user)
+        serializer.save(created_by=self.request.user, school_id=school_id)
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
@@ -977,11 +2183,14 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             extra = {k: (v if isinstance(v, str) else str(v)) for k, v in item.items()
                      if k not in RESERVED_KEYS and v is not None and str(v).strip() != ''}
             try:
+                school_id = get_user_school_id(request.user)
                 participant = Participant.objects.create(
                     name=name,
                     clicker_id=clicker_id,
                     email=email,
-                    extra=extra
+                    school_id=school_id,
+                    extra=extra,
+                    created_by=request.user,
                 )
                 created.append(ParticipantSerializer(participant).data)
             except Exception as e:
@@ -1028,6 +2237,22 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     'employee code': 'employee_code', 'employee code.': 'employee_code',
                     'teacher name': 'teacher_name', 'teacher': 'teacher_name', 'teaccher name': 'teacher_name',
                     'email id': 'email_id', 'email': 'email_id', 'e-mail': 'email_id', 'email address': 'email_id',
+                    'parent email id': 'parent_email_id', 'parent email': 'parent_email_id',
+                    'parent e-mail': 'parent_email_id', 'parent e mail': 'parent_email_id',
+                    'parent_email': 'parent_email_id', 'parent_email_id': 'parent_email_id',
+                    'parents email': 'parent_email_id', 'parents email id': 'parent_email_id',
+                    'father email': 'parent_email_id', 'mother email': 'parent_email_id',
+                    'guardian email': 'parent_email_id',
+                    'parent whatsapp': 'parent_whatsapp',
+                    'parent whatsapp number': 'parent_whatsapp',
+                    'parent whatsapp no': 'parent_whatsapp',
+                    'parent phone': 'parent_whatsapp',
+                    'parent mobile': 'parent_whatsapp',
+                    'parent mobile number': 'parent_whatsapp',
+                    'guardian phone': 'parent_whatsapp',
+                    'guardian mobile': 'parent_whatsapp',
+                    'whatsapp': 'parent_whatsapp',
+                    'whatsapp number': 'parent_whatsapp',
                 }
                 return COLUMN_TO_EXTRA_KEY.get(s) or s.replace(' ', '_').replace('.', '').replace('-', '_') or None
 
@@ -1083,14 +2308,16 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                             extra['email_id'] = extra.get('email_id') or email
                             email = None
                     
+                    school_id = get_user_school_id(request.user)
                     participant, created = Participant.objects.update_or_create(
                         clicker_id=clicker_id,
-                        defaults={'name': name, 'email': email, 'extra': extra}
+                        created_by=request.user,
+                        defaults={'name': name, 'email': email, 'school_id': school_id, 'extra': extra},
                     )
                     
                     if exam_id:
                         try:
-                            exam = Exam.objects.get(id=exam_id, created_by=request.user)
+                            exam = scope_exams_queryset(Exam.objects.all(), request.user).get(id=exam_id)
                             ExamParticipant.objects.get_or_create(exam=exam, participant=participant)
                         except Exam.DoesNotExist:
                             pass
@@ -1111,10 +2338,240 @@ class ParticipantViewSet(viewsets.ModelViewSet):
         if not clicker_id:
             return Response({'error': 'clicker_id required'}, status=status.HTTP_400_BAD_REQUEST)
         
-        participant.clicker_id = clicker_id
-        participant.save()
-        
-        return Response(ParticipantSerializer(participant).data)
+        serializer = ParticipantSerializer(
+            participant,
+            data={'clicker_id': str(clicker_id).strip()},
+            partial=True,
+            context={'request': request},
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+
+# RBAC: Schools and user management
+class SchoolViewSet(viewsets.ModelViewSet):
+    """Schools: list/create for Super Admin; list own for School Admin."""
+    serializer_class = SchoolSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        return scope_schools_queryset(School.objects.all(), self.request.user)
+
+    def perform_create(self, serializer):
+        if not can_create_school_admin(self.request.user):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('Only Super Admin can create schools.')
+        serializer.save()
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_school_admin(request):
+    """Create a School Admin user. Super Admin only."""
+    if not can_create_school_admin(request.user):
+        return Response({'error': 'Only Super Admin can create School Admins.'}, status=status.HTTP_403_FORBIDDEN)
+    serializer = CreateSchoolAdminSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        user = serializer.save()
+        return Response({
+            'id': user.id,
+            'email': user.email,
+            'role': 'school_admin',
+            'school_id': user.profile.school_id,
+            'message': 'School Admin created.',
+        }, status=status.HTTP_201_CREATED)
+    except drf_serializers.ValidationError as e:
+        return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def manage_school_admin(request, user_id):
+    """Edit or delete a School Admin user. Super Admin only."""
+    from django.contrib.auth.models import User
+    if not can_create_school_admin(request.user):
+        return Response({'error': 'Only Super Admin can manage School Admins.'}, status=status.HTTP_403_FORBIDDEN)
+    try:
+        user = User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        profile = user.profile
+    except UserProfile.DoesNotExist:
+        return Response({'error': 'User has no profile.'}, status=status.HTTP_400_BAD_REQUEST)
+    if profile.role != ROLE_SCHOOL_ADMIN:
+        return Response({'error': 'User is not a School Admin.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if request.method == 'DELETE':
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # PATCH
+    data = request.data or {}
+    email = data.get('email')
+    name = data.get('name')
+    school_id = data.get('school_id')
+    password = data.get('password')
+    from django.contrib.auth.models import User as DjangoUser
+    from .models import School
+
+    if email:
+        email = email.strip()
+        if DjangoUser.objects.exclude(pk=user.pk).filter(email=email).exists():
+            return Response({'email': ['A user with this email already exists.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.email = email
+        user.username = email
+    if name is not None:
+        user.first_name = (name or '').strip()
+    user.save()
+
+    if school_id is not None:
+        try:
+            school_obj = School.objects.get(pk=school_id)
+        except School.DoesNotExist:
+            return Response({'school_id': ['School not found.']}, status=status.HTTP_400_BAD_REQUEST)
+        profile.school = school_obj
+        profile.save()
+
+    if password:
+        if len(password) < 8:
+            return Response({'password': ['Password must be at least 8 characters.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(password)
+        user.save()
+
+    return Response({
+        'id': user.id,
+        'email': user.email,
+        'name': (user.first_name or '').strip() or user.email,
+        'school_id': profile.school_id,
+        'school_name': profile.school.name if profile.school else '',
+    })
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def create_teacher(request):
+    """Create a Teacher user. Super Admin or School Admin (for their school)."""
+    if not can_create_teacher(request.user):
+        return Response({'error': 'Only Super Admin or School Admin can create Teachers.'}, status=status.HTTP_403_FORBIDDEN)
+    data = request.data.copy()
+    role = get_user_role(request.user)
+    if role == ROLE_SCHOOL_ADMIN:
+        data['school_id'] = get_user_school_id(request.user)
+    serializer = CreateTeacherSerializer(data=data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        user = serializer.save()
+        return Response({
+            'id': user.id,
+            'email': user.email,
+            'role': 'teacher',
+            'school_id': user.profile.school_id,
+            'message': 'Teacher created.',
+        }, status=status.HTTP_201_CREATED)
+    except drf_serializers.ValidationError as e:
+        return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def manage_teacher(request, user_id):
+    """Edit or delete a Teacher user. Super Admin or School Admin (their school)."""
+    from django.contrib.auth.models import User
+    role = get_user_role(request.user)
+    if role not in (ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN):
+        return Response({'error': 'Only Super Admin or School Admin can manage Teachers.'}, status=status.HTTP_403_FORBIDDEN)
+    try:
+        user = User.objects.get(pk=user_id)
+    except User.DoesNotExist:
+        return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    try:
+        profile = user.profile
+    except UserProfile.DoesNotExist:
+        return Response({'error': 'User has no profile.'}, status=status.HTTP_400_BAD_REQUEST)
+    if profile.role != ROLE_TEACHER:
+        return Response({'error': 'User is not a Teacher.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    # School Admin can only manage teachers in their own school
+    if role == ROLE_SCHOOL_ADMIN:
+        admin_school_id = get_user_school_id(request.user)
+        if not admin_school_id or profile.school_id != admin_school_id:
+            return Response({'error': 'You can only manage teachers in your school.'}, status=status.HTTP_403_FORBIDDEN)
+
+    if request.method == 'DELETE':
+        user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    data = request.data or {}
+    email = data.get('email')
+    name = data.get('name')
+    school_id = data.get('school_id')
+    password = data.get('password')
+    from django.contrib.auth.models import User as DjangoUser
+    from .models import School
+
+    if email:
+        email = email.strip()
+        if DjangoUser.objects.exclude(pk=user.pk).filter(email=email).exists():
+            return Response({'email': ['A user with this email already exists.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.email = email
+        user.username = email
+    if name is not None:
+        user.first_name = (name or '').strip()
+    user.save()
+
+    if school_id is not None:
+        try:
+            school_obj = School.objects.get(pk=school_id)
+        except School.DoesNotExist:
+            return Response({'school_id': ['School not found.']}, status=status.HTTP_400_BAD_REQUEST)
+        # For school_admin, ensure they are not moving teacher out of their school
+        if role == ROLE_SCHOOL_ADMIN and school_obj.id != admin_school_id:
+            return Response({'school_id': ['You can only assign teachers to your school.']}, status=status.HTTP_400_BAD_REQUEST)
+        profile.school = school_obj
+        profile.save()
+
+    if password:
+        if len(password) < 8:
+            return Response({'password': ['Password must be at least 8 characters.']}, status=status.HTTP_400_BAD_REQUEST)
+        user.set_password(password)
+        user.save()
+
+    return Response({
+        'id': user.id,
+        'email': user.email,
+        'name': (user.first_name or '').strip() or user.email,
+        'school_id': profile.school_id,
+        'school_name': profile.school.name if profile.school else '',
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_exam_owners(request):
+    """List School Admins and Teachers for exam owner dropdown. Super Admin sees all; School Admin sees teachers in their school."""
+    from django.contrib.auth.models import User
+    role = get_user_role(request.user)
+    school_id = get_user_school_id(request.user)
+    if role == ROLE_TEACHER:
+        return Response([])
+    qs = UserProfile.objects.filter(role__in=[ROLE_SCHOOL_ADMIN, ROLE_TEACHER]).select_related('user', 'school')
+    if role == ROLE_SCHOOL_ADMIN and school_id is not None:
+        qs = qs.filter(school_id=school_id)
+    out = []
+    for p in qs.order_by('school__name', 'user__email'):
+        out.append({
+            'id': p.user_id,
+            'email': p.user.email or '',
+            'name': (p.user.first_name or '').strip() or p.user.email or str(p.user_id),
+            'role': p.role,
+            'school_id': p.school_id,
+            'school_name': p.school.name if p.school else '',
+        })
+    return Response(out)
 
 
 # Reports Views
@@ -1132,11 +2589,6 @@ def _report_now_ist():
 def _report_datetime_ist():
     """Return current datetime string in IST, format dd/mm/yyyy HH:MM (e.g. 08/03/2026 14:30)."""
     return _report_now_ist().strftime('%d/%m/%Y %H:%M')
-
-
-def _report_datetime_ist_12h():
-    """Return current datetime string in IST with 12-hour AM/PM (e.g. 08/03/2026 02:30 PM)."""
-    return _report_now_ist().strftime('%d/%m/%Y %I:%M:%S %p')
 
 # Participant fields to include in report export (label for display, key in Participant.extra or model)
 PARTICIPANT_REPORT_FIELDS = [
@@ -1156,6 +2608,8 @@ PARTICIPANT_REPORT_FIELDS = [
     ('Employee Code', 'employee_code'),
     ('Teacher Name', 'teacher_name'),
     ('Email ID', 'email_id'),
+    ('Parent Email ID', 'parent_email_id'),
+    ('Parent WhatsApp', 'parent_whatsapp'),
 ]
 
 
@@ -1213,8 +2667,32 @@ def _participant_report_row(participant):
         'employee_code': extra.get('employee_code', ''),
         'teacher_name': extra.get('teacher_name', ''),
         'email_id': email_id,
+        'parent_email_id': extra.get('parent_email_id', ''),
+        'parent_whatsapp': (
+            extra.get('parent_whatsapp')
+            or extra.get('parent_phone')
+            or extra.get('parent_mobile')
+            or ''
+        ),
     }
     return row
+
+
+def _seconds_per_attempt_from_answers(exam):
+    """Total time per attempt = sum(Answer.time_taken); same basis as leaderboard and report Speed columns."""
+    rows = (
+        Answer.objects.filter(attempt__exam=exam)
+        .values('attempt_id')
+        .annotate(total=Sum('time_taken'))
+    )
+    return {r['attempt_id']: max(0, int(r['total'] or 0)) for r in rows}
+
+
+def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
+    """Prefer sum of answer times (leaderboard / exports); fallback to stored attempt field."""
+    if attempt.id in seconds_from_answers:
+        return seconds_from_answers[attempt.id]
+    return max(0, int(attempt.time_taken or 0))
 
 
 def _get_exam_report_data(exam):
@@ -1235,9 +2713,9 @@ def _get_exam_report_data(exam):
     avg_score = attempts.aggregate(avg=Avg('score'))['avg'] or 0
     highest = attempts.aggregate(max=Max('score'))['max'] or 0
     lowest = attempts.aggregate(min=Min('score'))['min'] or 0
-    questions = exam.exam_questions.select_related('question').order_by('order')
+    questions_ordered = list(exam.exam_questions.select_related('question').order_by('order'))
     question_analysis = []
-    for eq in questions:
+    for eq in questions_ordered:
         question = eq.question
         answers = Answer.objects.filter(attempt__exam=exam, question=question)
         total_attempts = answers.count()
@@ -1269,10 +2747,33 @@ def _get_exam_report_data(exam):
             'correct_answer': _normalize_correct_answer(question.correct_answer),
             'option_votes': option_votes,
         })
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts_sorted = list(attempts.select_related('participant'))
+    attempts_sorted.sort(
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        )
+    )
+    answer_map_report = {
+        (a.attempt_id, a.question_id): a
+        for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question')
+    }
     participant_results = []
-    for attempt in attempts.order_by('-score', 'time_taken'):
+    for attempt in attempts_sorted:
         p = attempt.participant
         user_row = _participant_report_row(p)
+        display_time = _leaderboard_display_time_seconds(attempt, seconds_from_answers)
+        question_answers = []
+        for eq in questions_ordered:
+            q = eq.question
+            ans = answer_map_report.get((attempt.id, q.id))
+            question_answers.append({
+                'question_id': q.id,
+                'response': _format_attempted_option_label(q, ans.selected_answer) if ans else '',
+                'correct_answer': _format_correct_answer_display(q),
+                'is_correct': ans.is_correct if ans else None,
+            })
         participant_results.append({
             'participant_id': p.id,
             'participant_name': p.name,
@@ -1299,7 +2800,9 @@ def _get_exam_report_data(exam):
             'wrong_answers': attempt.wrong_answers,
             'unattempted': attempt.unattempted,
             'percentage': float(attempt.percentage),
-            'rank': 0
+            'time_taken': display_time,
+            'rank': 0,
+            'question_answers': question_answers,
         })
     for idx, result in enumerate(participant_results, 1):
         result['rank'] = idx
@@ -1320,8 +2823,9 @@ def _get_exam_report_data(exam):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def exam_report(request, exam_id):
+    qs = scope_exams_queryset(Exam.objects.all(), request.user)
     try:
-        exam = Exam.objects.get(id=exam_id)
+        exam = qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
     report_data = _get_exam_report_data(exam)
@@ -1363,28 +2867,60 @@ def _option_label_for_index(index, option_display):
     return chr(65 + index) if 0 <= index < 26 else str(index + 1)
 
 
+def _question_option_display(question):
+    return getattr(question, 'option_display', 'alpha') or 'alpha'
+
+
+def _format_correct_answer_display(question):
+    """Correct option label(s) for reports: A/B/C or 1/2/3 per question option_display."""
+    raw = getattr(question, 'correct_answer', None)
+    if raw is None:
+        return ''
+    display = _question_option_display(question)
+    indices = _normalize_correct_answer(raw)
+    if not indices:
+        return ''
+    return ', '.join(_option_label_for_index(i, display) for i in indices)
+
+
 def _format_attempted_option_label(question, selected_answer):
-    """Return the attempted option label(s) for display as numeric (1, 2, 3...). For MCQ/true_false show single number; for multiple_select show comma-separated."""
+    """Attempted option label(s) for reports: A/B/C or 1/2/3 per question option_display."""
     if selected_answer is None:
         return ''
-    # Single-choice (MCQ, true_false): show one number only (if stored as list, take first)
+    display = _question_option_display(question)
     qtype = getattr(question, 'type', 'mcq')
     if qtype in ('mcq', 'true_false'):
         if isinstance(selected_answer, list):
             selected_answer = selected_answer[0] if selected_answer else None
         if selected_answer is None:
             return ''
-        return str(selected_answer + 1)
-    # Multiple-select: show comma-separated numbers
+        try:
+            idx = int(selected_answer)
+        except (TypeError, ValueError):
+            return str(selected_answer)
+        return _option_label_for_index(idx, display)
     if isinstance(selected_answer, list):
-        return ', '.join(str(i + 1) for i in selected_answer)
-    return str(selected_answer + 1)
+        parts = []
+        for i in selected_answer:
+            if i is None:
+                continue
+            try:
+                parts.append(_option_label_for_index(int(i), display))
+            except (TypeError, ValueError):
+                parts.append(str(i))
+        return ', '.join(parts)
+    try:
+        return _option_label_for_index(int(selected_answer), display)
+    except (TypeError, ValueError):
+        return str(selected_answer)
 
 
-def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None):
+def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
     """Write 'Results by Participants(Detail)' sheet to match client format: metadata, then per-participant blocks with Keypad/Name line and table Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data."""
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     sheet_name = 'Results by Participants(Detail)'
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
@@ -1398,11 +2934,22 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts_ranked = sorted(
+        ExamAttempt.objects.filter(exam=exam),
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        ),
+    )
+    rank_by_attempt_id = {a.id: rank for rank, a in enumerate(attempts_ranked, 1)}
+    total_participants = len(attempts_ranked)
+
     row_num = 1
     ws.cell(row=row_num, column=1, value='Results by Participants(Detail)')
     ws.cell(row=row_num, column=1).font = Font(bold=True, size=14)
     row_num += 1
-    ws.cell(row=row_num, column=1, value=_report_datetime_ist())
+    ws.cell(row=row_num, column=1, value=report_timestamp_str)
     row_num += 1
     ws.cell(row=row_num, column=1, value=f'Questions Count: {len(exam_questions)}')
     row_num += 2
@@ -1434,7 +2981,7 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
         correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
         ws.cell(row=row_num, column=1, value=detail_line)
         ws.cell(row=row_num, column=2, value=f'Correct Rate: {correct_rate:.2f}%')
-        ws.cell(row=row_num, column=3, value=f'Ranking: {attempt.correct_answers}/{attempt.total_questions}')
+        ws.cell(row=row_num, column=3, value=f'Ranking: {rank_by_attempt_id.get(attempt.id, "")}/{total_participants}')
         row_num += 1
         # Table header: Question, Option, Response, Slide Type, Correct Answer, Speed, Score
         headers = ['Question', 'Option', 'Response', 'Slide Type', 'Correct Answer', 'Speed', 'Score']
@@ -1447,25 +2994,20 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
             q = eq.question
             options_text = _format_question_options(q)
             answer = answer_map.get((attempt.id, q.id))
-            correct_idx = q.correct_answer
-            if isinstance(correct_idx, list):
-                correct_display = correct_idx[0] + 1 if correct_idx else ''
-            else:
-                correct_display = int(correct_idx) + 1 if correct_idx is not None else ''
+            correct_display = _format_correct_answer_display(q)
             if answer:
                 sel = answer.selected_answer
-                if isinstance(sel, list):
-                    response_val = (sel[0] + 1) if sel else ''
-                else:
-                    response_val = int(sel) + 1 if sel is not None else ''
-                speed = round(answer.time_taken, 2) if answer.time_taken is not None else ''
+                response_val = _format_attempted_option_label(q, sel)
+                # Speed = time taken for this question in seconds (integer from DB)
+                speed = answer.time_taken if answer.time_taken is not None else 0
                 score = int(eq.positive_marks) if answer.is_correct else -int(eq.negative_marks)
             else:
                 response_val = ''
                 speed = ''
                 score = 0
             ws.cell(row=row_num, column=1, value=f'{order_idx}. {_strip_html(q.text)}')
-            ws.cell(row=row_num, column=2, value=options_text)
+            opt_cell = ws.cell(row=row_num, column=2, value=options_text)
+            opt_cell.alignment = Alignment(wrap_text=True, vertical='top')
             ws.cell(row=row_num, column=3, value=response_val)
             ws.cell(row=row_num, column=4, value='Choice')
             ws.cell(row=row_num, column=5, value=correct_display)
@@ -1490,10 +3032,12 @@ def _sanitize_sheet_name(name):
     return (name or 'Sheet')[:31]
 
 
-def _write_results_by_participants_individual(workbook, exam, participant_detail_columns=None):
+def _write_results_by_participants_individual(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
     """One sheet per participant (sheet name = keypad id). Same layout as reference: title, date, questions count, metadata, Keypad summary, then Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data (if participant_detail_columns provided)."""
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     red_header_fill = PatternFill(start_color='FF0000', end_color='FF0000', fill_type='solid')
     white_font = Font(color='FFFFFF', bold=True)
     bold_font = Font(bold=True)
@@ -1504,8 +3048,19 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts_ranked = sorted(
+        ExamAttempt.objects.filter(exam=exam),
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        ),
+    )
+    rank_by_attempt_id = {a.id: rank for rank, a in enumerate(attempts_ranked, 1)}
+    total_participants = len(attempts_ranked)
+
     n_questions = len(exam_questions)
-    report_date = _report_datetime_ist()
+    report_date = report_timestamp_str
 
     for attempt in attempts:
         participant = attempt.participant
@@ -1547,7 +3102,7 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
         correct_rate = (attempt.correct_answers / attempt.total_questions * 100) if attempt.total_questions else 0
         ws.cell(row=row, column=1, value=detail_line)
         ws.cell(row=row, column=2, value=f'Correct Rate: {correct_rate:.2f}%')
-        ws.cell(row=row, column=3, value=f'Ranking: {attempt.correct_answers}/{attempt.total_questions}')
+        ws.cell(row=row, column=3, value=f'Ranking: {rank_by_attempt_id.get(attempt.id, "")}/{total_participants}')
         row += 1
         # Table header
         headers = ['Question', 'Option', 'Response', 'Slide Type', 'Correct Answer', 'Speed', 'Score']
@@ -1556,30 +3111,25 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
             c.fill = red_header_fill
             c.font = white_font
         row += 1
-        # One row per question (match reference: Response = 1-based index, Slide Type = 'Choice', Correct Answer = 1-based correct index, Speed = decimal)
+        # One row per question: Response / Correct Answer use option_display (alpha vs numeric).
         for order_idx, eq in enumerate(exam_questions, start=1):
             q = eq.question
             options_text = _format_question_options(q)
             answer = answer_map.get((attempt.id, q.id))
-            correct_idx = q.correct_answer
-            if isinstance(correct_idx, list):
-                correct_display = correct_idx[0] + 1 if correct_idx else ''
-            else:
-                correct_display = int(correct_idx) + 1 if correct_idx is not None else ''
+            correct_display = _format_correct_answer_display(q)
             if answer:
                 sel = answer.selected_answer
-                if isinstance(sel, list):
-                    response_val = (sel[0] + 1) if sel else ''
-                else:
-                    response_val = int(sel) + 1 if sel is not None else ''
-                speed = round(answer.time_taken, 2) if answer.time_taken is not None else ''
+                response_val = _format_attempted_option_label(q, sel)
+                # Speed = time taken for this question in seconds
+                speed = answer.time_taken if answer.time_taken is not None else 0
                 score = int(eq.positive_marks) if answer.is_correct else -int(eq.negative_marks)
             else:
                 response_val = ''
                 speed = ''
                 score = 0
             ws.cell(row=row, column=1, value=f'{order_idx}. {_strip_html(q.text)}')
-            ws.cell(row=row, column=2, value=options_text)
+            opt_cell = ws.cell(row=row, column=2, value=options_text)
+            opt_cell.alignment = Alignment(wrap_text=True, vertical='top')
             ws.cell(row=row, column=3, value=response_val)
             ws.cell(row=row, column=4, value='Choice')
             ws.cell(row=row, column=5, value=correct_display)
@@ -1602,8 +3152,10 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
             break
 
 
-def _write_results_by_questions_sheet(workbook, exam):
+def _write_results_by_questions_sheet(workbook, exam, report_timestamp_str=None):
     """One sheet 'Results by Questions': per-question blocks with Option, Voted, Percentage (like reference)."""
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     sheet_name = 'Results by Questions'
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
@@ -1625,7 +3177,7 @@ def _write_results_by_questions_sheet(workbook, exam):
     row += 1
     ws.cell(row=row, column=1, value=exam.title or '')
     row += 1
-    ws.cell(row=row, column=1, value=_report_datetime_ist_12h())
+    ws.cell(row=row, column=1, value=report_timestamp_str)
     row += 2
     for label, col_b in [
         ('Sl No.', ''),
@@ -1706,8 +3258,10 @@ PERSONAL_ACHIEVEMENT_HEADERS = [
 ]
 
 
-def _write_personal_achievement_and_detail_sheet(workbook, exam):
+def _write_personal_achievement_and_detail_sheet(workbook, exam, report_timestamp_str=None):
     """Write 'Personal Achievement and Detail' sheet: title, Voted, exam info, then table of participants with details + score + per-question columns."""
+    if report_timestamp_str is None:
+        report_timestamp_str = _report_datetime_ist()
     sheet_name = 'Personal Achievement and Detail'
     if sheet_name in workbook.sheetnames:
         del workbook[sheet_name]
@@ -1725,10 +3279,13 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
-    # Rank attempted by score (desc), then time (asc)
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempted_list = sorted(
         [attempts_by_participant[ep.participant_id] for ep in assigned if ep.participant_id in attempts_by_participant],
-        key=lambda a: (-float(a.score), a.time_taken)
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        ),
     )
     rank_by_attempt = {a.id: idx + 1 for idx, a in enumerate(attempted_list)}
     voted_count = len(attempted_list)
@@ -1743,7 +3300,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam):
     row += 1
     ws.cell(row=row, column=1, value=exam.title or '')
     row += 1
-    ws.cell(row=row, column=1, value=_report_datetime_ist())
+    ws.cell(row=row, column=1, value=report_timestamp_str)
     row += 1
     for label, col_b in [
         ('Sl No.', ''),
@@ -1844,10 +3401,11 @@ def _build_export_http_response(request, exam):
     raw = (request.query_params.get('format') or 'excel').strip().lower()
     format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
     layout = (request.query_params.get('layout') or '').strip().lower()
+    report_timestamp_str = _report_datetime_ist()
     report_data = _get_exam_report_data(exam)
     detail_columns = report_data.get('participant_detail_columns') or []
     detail_keys = [k for (_, k) in detail_columns]
-    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'rank']
+    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'time_taken', 'rank']
     export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
     df = df[[c for c in export_columns if c in df.columns]]
@@ -1859,10 +3417,15 @@ def _build_export_http_response(request, exam):
         content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             if layout == 'personal_achievement':
-                _write_personal_achievement_and_detail_sheet(writer.book, exam)
+                _write_personal_achievement_and_detail_sheet(
+                    writer.book, exam, report_timestamp_str=report_timestamp_str
+                )
                 filename = f'report-{exam.id}-personal-achievement.xlsx'
             else:
-                _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
+                _write_results_by_participants_detail_sheet(
+                    writer.book, exam, participant_detail_columns=detail_columns,
+                    report_timestamp_str=report_timestamp_str,
+                )
                 filename = f'report-{exam.id}.xlsx'
     else:
         content_type = 'text/csv'
@@ -1896,10 +3459,11 @@ export_report.renderer_classes = [BinaryFileRenderer]
 
 def _build_export_file_response(format_type, exam, layout=None):
     """Build Excel or CSV as Django HttpResponse. layout='individual' => one sheet per participant; layout='questions' => Results by Questions; layout='personal_achievement' => Personal Achievement and Detail."""
+    report_timestamp_str = _report_datetime_ist()
     report_data = _get_exam_report_data(exam)
     detail_columns = report_data.get('participant_detail_columns') or []
     detail_keys = [k for (_, k) in detail_columns]
-    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'rank']
+    base_columns = ['participant_id', 'score', 'total_questions', 'correct_answers', 'wrong_answers', 'unattempted', 'percentage', 'time_taken', 'rank']
     export_columns = ['participant_id'] + detail_keys + base_columns
     df = pd.DataFrame(report_data['participant_results'])
     df = df[[c for c in export_columns if c in df.columns]]
@@ -1911,10 +3475,13 @@ def _build_export_file_response(format_type, exam, layout=None):
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             layout_l = (layout or '').strip().lower()
             if layout_l == 'individual':
-                _write_results_by_participants_individual(writer.book, exam, participant_detail_columns=detail_columns)
+                _write_results_by_participants_individual(
+                    writer.book, exam, participant_detail_columns=detail_columns,
+                    report_timestamp_str=report_timestamp_str,
+                )
                 filename = f'report-{exam.id}-individual.xlsx'
             elif layout_l == 'questions':
-                _write_results_by_questions_sheet(writer.book, exam)
+                _write_results_by_questions_sheet(writer.book, exam, report_timestamp_str=report_timestamp_str)
                 # Remove default sheet if pandas created one
                 for default in ('Sheet', 'Sheet1'):
                     if default in writer.book.sheetnames and len(writer.book.sheetnames) > 1:
@@ -1922,10 +3489,15 @@ def _build_export_file_response(format_type, exam, layout=None):
                         break
                 filename = f'report-{exam.id}-questions.xlsx'
             elif layout_l == 'personal_achievement':
-                _write_personal_achievement_and_detail_sheet(writer.book, exam)
+                _write_personal_achievement_and_detail_sheet(
+                    writer.book, exam, report_timestamp_str=report_timestamp_str
+                )
                 filename = f'report-{exam.id}-personal-achievement.xlsx'
             else:
-                _write_results_by_participants_detail_sheet(writer.book, exam, participant_detail_columns=detail_columns)
+                _write_results_by_participants_detail_sheet(
+                    writer.book, exam, participant_detail_columns=detail_columns,
+                    report_timestamp_str=report_timestamp_str,
+                )
                 filename = f'report-{exam.id}.xlsx'
         content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     else:
@@ -1948,8 +3520,14 @@ def export_report_http(request, exam_id):
         user_auth = None
     if user_auth is None:
         return JsonResponse({'detail': 'Authentication credentials were not provided.'}, status=401)
+    # JWTAuthentication.authenticate() returns a (user, token) tuple, but
+    # since this is a plain Django view we must attach it to request manually.
+    user, token = user_auth
+    request.user = user
+    request.auth = token
+    exam_qs = scope_exams_queryset(Exam.objects.all(), request.user)
     try:
-        exam = Exam.objects.get(id=exam_id)
+        exam = exam_qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return JsonResponse(
             {'error': 'Exam not found', 'exam_id': exam_id, 'message': 'No exam with this id. Run: python manage.py seed_dummy_data'},
@@ -1966,14 +3544,15 @@ def export_report_http(request, exam_id):
 @permission_classes([IsAuthenticated])
 def dashboard(request):
     user = request.user
-    exams = Exam.objects.filter(created_by=user)
+    exams = scope_exams_queryset(Exam.objects.all(), user)
     
     # Stats
     total_exams = exams.count()
-    total_participants = Participant.objects.count()
+    participants_qs = scope_participants_queryset(Participant.objects.all(), user)
+    total_participants = participants_qs.count()
     
-    # Calculate average score from all attempts
-    all_attempts = ExamAttempt.objects.filter(exam__created_by=user).select_related('exam')
+    # Calculate average score from all attempts (only for user's visible exams)
+    all_attempts = ExamAttempt.objects.filter(exam__in=exams).select_related('exam')
     if all_attempts.exists():
         total_percentage = 0
         count = 0
@@ -1987,7 +3566,7 @@ def dashboard(request):
         avg_score = 0
     
     # Attendance rate (participants who attempted / total participants)
-    total_assigned = ExamParticipant.objects.filter(exam__created_by=user).count()
+    total_assigned = ExamParticipant.objects.filter(exam__in=exams).count()
     attempted = all_attempts.count()
     attendance_rate = (attempted / total_assigned * 100) if total_assigned > 0 else 0
     
@@ -2063,19 +3642,170 @@ def dashboard(request):
     return Response(serializer.data)
 
 
+def _build_student_performance_rows(user, query_params):
+    """Build role-scoped student performance rows from query params."""
+    # Role-wise scoping
+    participants_qs = scope_participants_queryset(Participant.objects.all(), user)
+    exams_qs = scope_exams_queryset(Exam.objects.all(), user)
+
+    admission_no = (query_params.get('admission_no') or '').strip().lower()
+    roll_no = (query_params.get('roll_no') or '').strip().lower()
+    student_name = (query_params.get('student_name') or '').strip().lower()
+    class_name = (query_params.get('class_name') or '').strip().lower()
+    section = (query_params.get('section') or '').strip().lower()
+    teacher_name = (query_params.get('teacher_name') or '').strip().lower()
+    subject = (query_params.get('subject') or '').strip().lower()
+    from_date = (query_params.get('from_date') or '').strip()
+    to_date = (query_params.get('to_date') or '').strip()
+
+    attempts_qs = ExamAttempt.objects.filter(
+        exam__in=exams_qs,
+        participant__in=participants_qs,
+    ).select_related('participant', 'exam')
+
+    if from_date:
+        attempts_qs = attempts_qs.filter(submitted_at__date__gte=from_date)
+    if to_date:
+        attempts_qs = attempts_qs.filter(submitted_at__date__lte=to_date)
+
+    rows_by_participant = {}
+    for attempt in attempts_qs:
+        p = attempt.participant
+        if not p:
+            continue
+        extra = p.extra or {}
+        name_val = (p.name or '').strip()
+        row = rows_by_participant.get(p.id)
+        if row is None:
+            row = {
+                'participant_id': p.id,
+                'admission_no': (extra.get('admission_no') or '').strip() if isinstance(extra, dict) else '',
+                'roll_no': (extra.get('roll_no') or '').strip() if isinstance(extra, dict) else '',
+                'student_name': name_val,
+                'class_name': (extra.get('class') or '').strip() if isinstance(extra, dict) else '',
+                'section': (extra.get('section') or '').strip() if isinstance(extra, dict) else '',
+                'teacher_name': (extra.get('teacher_name') or '').strip() if isinstance(extra, dict) else '',
+                'subject': (extra.get('subject') or '').strip() if isinstance(extra, dict) else '',
+                '_attempts': 0,
+                '_pct_sum': 0.0,
+            }
+            rows_by_participant[p.id] = row
+
+        pct = 0.0
+        if attempt.total_questions and float(getattr(attempt.exam, 'positive_marking', 1) or 1) > 0:
+            pct = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
+        row['_attempts'] += 1
+        row['_pct_sum'] += pct
+
+    rows = []
+    for row in rows_by_participant.values():
+        # Apply text filters on flattened row values
+        if admission_no and admission_no not in (row['admission_no'] or '').lower():
+            continue
+        if roll_no and roll_no not in (row['roll_no'] or '').lower():
+            continue
+        if student_name and student_name not in (row['student_name'] or '').lower():
+            continue
+        if class_name and class_name not in (row['class_name'] or '').lower():
+            continue
+        if section and section not in (row['section'] or '').lower():
+            continue
+        if teacher_name and teacher_name not in (row['teacher_name'] or '').lower():
+            continue
+        if subject and subject not in (row['subject'] or '').lower():
+            continue
+
+        attempts_count = row.pop('_attempts', 0) or 0
+        pct_sum = row.pop('_pct_sum', 0.0) or 0.0
+        row['total_percentage'] = round((pct_sum / attempts_count), 2) if attempts_count > 0 else 0.0
+        rows.append(row)
+
+    rows.sort(key=lambda x: (-float(x.get('total_percentage') or 0), (x.get('student_name') or '').lower()))
+    return rows
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def student_performance_report(request):
+    """
+    GET /api/reports/student-performance/
+    Role-scoped student performance rows with optional filters:
+      admission_no, roll_no, student_name, class_name, section, teacher_name, subject,
+      from_date (YYYY-MM-DD), to_date (YYYY-MM-DD)
+    """
+    rows = _build_student_performance_rows(request.user, request.query_params)
+    return Response({'count': len(rows), 'results': rows})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def student_performance_report_export(request):
+    """
+    GET /api/reports/student-performance/export/?file_format=excel|csv&...
+    Exports student performance report with current filters.
+    """
+    rows = _build_student_performance_rows(request.user, request.query_params)
+    # DRF reserves `format` for content negotiation in some setups; prefer `file_format`.
+    raw = (request.query_params.get('file_format') or request.query_params.get('format') or 'excel').strip().lower()
+    format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
+
+    columns = [
+        'admission_no', 'roll_no', 'student_name', 'class_name',
+        'section', 'teacher_name', 'subject', 'total_percentage'
+    ]
+    df = pd.DataFrame(rows, columns=columns)
+    df = df.rename(columns={
+        'admission_no': 'Admission No',
+        'roll_no': 'Roll No',
+        'student_name': 'Student Name',
+        'class_name': 'Class',
+        'section': 'Section',
+        'teacher_name': 'Teacher Name',
+        'subject': 'Subject',
+        'total_percentage': 'Total Percentage %',
+    })
+
+    output = BytesIO()
+    if format_type == 'excel':
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Student Performance', index=False)
+        content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        filename = 'student-performance-report.xlsx'
+    else:
+        df.to_csv(output, index=False)
+        content_type = 'text/csv'
+        filename = 'student-performance-report.csv'
+
+    output.seek(0)
+    response = HttpResponse(output.getvalue(), content_type=content_type)
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
+
+
 # Leaderboard Views
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def leaderboard(request, exam_id):
+    qs = scope_exams_queryset(Exam.objects.all(), request.user)
     try:
-        exam = Exam.objects.get(id=exam_id)
+        exam = qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
-    
-    attempts = ExamAttempt.objects.filter(exam=exam).order_by('-score', 'time_taken')
-    
+
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts = list(
+        ExamAttempt.objects.filter(exam=exam).select_related('participant')
+    )
+    attempts.sort(
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        )
+    )
+
     entries = []
     for rank, attempt in enumerate(attempts, 1):
+        display_time = _leaderboard_display_time_seconds(attempt, seconds_from_answers)
         entries.append({
             'rank': rank,
             'participant_id': attempt.participant.id,
@@ -2084,7 +3814,7 @@ def leaderboard(request, exam_id):
             'percentage': float(attempt.percentage),
             'total_questions': attempt.total_questions,
             'correct_answers': attempt.correct_answers,
-            'time_taken': attempt.time_taken
+            'time_taken': display_time
         })
     
     leaderboard_data = {
@@ -2096,3 +3826,93 @@ def leaderboard(request, exam_id):
     
     serializer = LeaderboardSerializer(leaderboard_data)
     return Response(serializer.data)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def export_leaderboard(request, exam_id):
+    """
+    GET /api/leaderboard/exams/{exam_id}/export/?format=excel|pdf
+    Downloads leaderboard report as Excel or PDF.
+    """
+    # DRF uses `?format=` for content negotiation; use `file_format` instead.
+    raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
+    format_type = 'pdf' if raw in ('pdf',) else 'excel'
+
+    qs = scope_exams_queryset(Exam.objects.all(), request.user)
+    try:
+        exam = qs.get(id=exam_id)
+    except Exam.DoesNotExist:
+        return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    seconds_from_answers = _seconds_per_attempt_from_answers(exam)
+    attempts = list(
+        ExamAttempt.objects.filter(exam=exam).select_related('participant')
+    )
+    attempts.sort(
+        key=lambda a: (
+            -float(a.score),
+            _leaderboard_display_time_seconds(a, seconds_from_answers),
+        )
+    )
+    entries = []
+    for rank, attempt in enumerate(attempts, 1):
+        display_time = _leaderboard_display_time_seconds(attempt, seconds_from_answers)
+        entries.append({
+            'Rank': rank,
+            'Participant ID': attempt.participant.id,
+            'Participant': attempt.participant.name,
+            'Score': float(attempt.score),
+            'Correct': attempt.correct_answers,
+            'Total Questions': attempt.total_questions,
+            'Percentage': float(attempt.percentage),
+            'Time Taken (sec)': display_time,
+        })
+
+    filename_base = f'leaderboard-{exam.id}'
+    if format_type == 'excel':
+        output = BytesIO()
+        df = pd.DataFrame(entries, columns=[
+            'Rank', 'Participant ID', 'Participant', 'Score', 'Correct',
+            'Total Questions', 'Percentage', 'Time Taken (sec)'
+        ])
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Leaderboard', index=False)
+        output.seek(0)
+        response = HttpResponse(output.getvalue(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        response['Content-Disposition'] = f'attachment; filename="{filename_base}.xlsx"'
+        return response
+
+    # PDF
+    output = BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=A4)
+    styles = getSampleStyleSheet()
+    elements = [
+        Paragraph(f'Leaderboard - {exam.title}', styles['Title']),
+        Spacer(1, 12),
+        Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
+        Spacer(1, 12),
+    ]
+
+    table_data = [[
+        'Rank', 'Participant', 'Score', 'Correct', 'Total', 'Percentage', 'Time Taken (sec)'
+    ]] + [
+        [e['Rank'], e['Participant'], e['Score'], e['Correct'], e['Total Questions'], e['Percentage'], e['Time Taken (sec)']]
+        for e in entries
+    ]
+    table = Table(table_data, repeatRows=1, hAlign='LEFT')
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+    ]))
+    elements.append(table)
+    doc.build(elements)
+    output.seek(0)
+
+    response = HttpResponse(output.getvalue(), content_type='application/pdf')
+    response['Content-Disposition'] = f'attachment; filename="{filename_base}.pdf"'
+    return response

@@ -3,23 +3,41 @@ from django.contrib.auth.models import User
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
     Exam, Question, ExamQuestion, Participant,
-    ExamParticipant, ExamAttempt, Answer
+    ExamParticipant, ExamAttempt, Answer, School, UserProfile,
+    ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN, ROLE_TEACHER,
 )
 
 
 class UserSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
+    school_id = serializers.SerializerMethodField()
+    school_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'role']
+        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'role', 'school_id', 'school_name']
         read_only_fields = ['id']
 
+    def _get_profile(self, obj):
+        try:
+            return obj.profile
+        except UserProfile.DoesNotExist:
+            role = ROLE_SUPER_ADMIN if obj.is_superuser else ROLE_TEACHER
+            return UserProfile.objects.get_or_create(user=obj, defaults={'role': role})[0]
+        except AttributeError:
+            return None
+
     def get_role(self, obj):
-        # Simple role logic - you can extend this with a proper role model
-        if obj.is_superuser:
-            return 'admin'
-        return 'instructor'
+        profile = self._get_profile(obj)
+        return profile.role if profile else ROLE_TEACHER
+
+    def get_school_id(self, obj):
+        profile = self._get_profile(obj)
+        return profile.school_id if profile else None
+
+    def get_school_name(self, obj):
+        profile = self._get_profile(obj)
+        return profile.school.name if profile and profile.school_id else None
 
 
 class LoginSerializer(serializers.Serializer):
@@ -43,13 +61,23 @@ class LoginSerializer(serializers.Serializer):
 
 
 class QuestionSerializer(serializers.ModelSerializer):
+    owner_name = serializers.SerializerMethodField()
+
     class Meta:
         model = Question
         fields = [
             'id', 'text', 'type', 'options', 'correct_answer', 'option_display',
-            'difficulty', 'tags', 'marks', 'created_at', 'updated_at'
+            'difficulty', 'tags', 'marks', 'image_url', 'video_url',
+            'created_at', 'updated_at', 'owner_name',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'owner_name']
+
+    def get_owner_name(self, obj):
+        user = getattr(obj, 'created_by', None)
+        if not user:
+            return None
+        name = (getattr(user, 'first_name', '') or '').strip() or (getattr(user, 'email', '') or '')
+        return name or str(user.id)
 
 
 class ExamQuestionSerializer(serializers.ModelSerializer):
@@ -71,14 +99,21 @@ class ExamSerializer(serializers.ModelSerializer):
     total_marks = serializers.SerializerMethodField()
     questions = ExamQuestionSerializer(source='exam_questions', many=True, read_only=True)
     can_edit = serializers.SerializerMethodField()
+    school_id = serializers.SerializerMethodField()
+    school_name = serializers.SerializerMethodField()
+    owner_id = serializers.SerializerMethodField()
+    owner_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Exam
         fields = [
             'id', 'title', 'description', 'duration', 'revisable', 'status',
+            'show_live_response', 'show_response_after_completion',
+            'question_change_automatic',
             'positive_marking', 'negative_marking', 'frozen', 'created_by',
             'created_at', 'updated_at', 'question_count', 'participant_count',
-            'total_marks', 'questions', 'can_edit', 'snapshot_data', 'snapshot_version'
+            'total_marks', 'questions', 'can_edit', 'snapshot_data', 'snapshot_version',
+            'school_id', 'school_name', 'owner_id', 'owner_name',
         ]
         read_only_fields = [
             'id', 'created_at', 'updated_at', 'created_by', 'frozen',
@@ -90,16 +125,38 @@ class ExamSerializer(serializers.ModelSerializer):
 
     def get_participant_count(self, obj):
         return obj.exam_participants.count()
-    
+
     def get_total_marks(self, obj):
         return float(obj.total_marks)
-    
+
     def get_can_edit(self, obj):
         return obj.can_edit()
 
+    def get_school_id(self, obj):
+        return obj.school_id
+
+    def get_school_name(self, obj):
+        return obj.school.name if obj.school else None
+
+    def get_owner_id(self, obj):
+        return obj.created_by_id if obj.created_by_id else None
+
+    def get_owner_name(self, obj):
+        if not obj.created_by:
+            return None
+        u = obj.created_by
+        name = (getattr(u, 'first_name', '') or '').strip() or (getattr(u, 'email', '') or '')
+        return name or str(obj.created_by_id)
+
     def create(self, validated_data):
-        validated_data['created_by'] = self.context['request'].user
+        user = self.context['request'].user
+        validated_data['created_by'] = user
         validated_data['status'] = 'draft'
+        try:
+            if user.profile.school_id:
+                validated_data['school_id'] = user.profile.school_id
+        except (UserProfile.DoesNotExist, AttributeError):
+            pass
         return super().create(validated_data)
 
 
@@ -111,19 +168,55 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
         required=False,
         help_text="List of questions with marks: [{'question_id': 1, 'order': 0, 'positive_marks': 1.0, 'negative_marks': 0.0, 'is_optional': false}]"
     )
+    owner_user_id = serializers.IntegerField(required=False, allow_null=True)
 
     class Meta:
         model = Exam
         fields = [
-            'id', 'title', 'description', 'duration', 'revisable', 'status', 'questions'
+            'id',
+            'title',
+            'description',
+            'duration',
+            'revisable',
+            'show_live_response',
+            'show_response_after_completion',
+            'question_change_automatic',
+            'status',
+            'questions',
+            'owner_user_id'
         ]
         read_only_fields = ['id']
+
+    def validate_owner_user_id(self, value):
+        if value is None:
+            return value
+        from django.contrib.auth.models import User
+        try:
+            profile = UserProfile.objects.get(user_id=value)
+        except UserProfile.DoesNotExist:
+            raise serializers.ValidationError('User has no profile.')
+        if profile.role not in (ROLE_SCHOOL_ADMIN, ROLE_TEACHER):
+            raise serializers.ValidationError('Owner must be a School Admin or Teacher.')
+        return value
 
     def validate(self, attrs):
         # Check if exam is frozen and trying to edit
         if self.instance and self.instance.status == 'frozen':
             raise serializers.ValidationError("Cannot edit a frozen exam")
-        
+
+        # School Admin can only assign owner in their school
+        owner_user_id = attrs.get('owner_user_id')
+        if owner_user_id is not None:
+            request_user = self.context['request'].user
+            try:
+                request_profile = request_user.profile
+            except (UserProfile.DoesNotExist, AttributeError):
+                request_profile = None
+            if request_profile and request_profile.role == ROLE_SCHOOL_ADMIN:
+                owner_profile = UserProfile.objects.filter(user_id=owner_user_id).first()
+                if not owner_profile or owner_profile.school_id != request_profile.school_id:
+                    raise serializers.ValidationError({'owner_user_id': 'Owner must be in your school.'})
+
         # Validate questions if provided
         questions = attrs.get('questions', [])
         if questions:
@@ -157,10 +250,29 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         questions_data = validated_data.pop('questions', [])
-        validated_data['created_by'] = self.context['request'].user
+        owner_user_id = validated_data.pop('owner_user_id', None)
+        request_user = self.context['request'].user
+        try:
+            request_role = request_user.profile.role
+        except (UserProfile.DoesNotExist, AttributeError):
+            request_role = None
+        if owner_user_id is not None and request_role in (ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN):
+            owner = User.objects.get(pk=owner_user_id)
+            validated_data['created_by'] = owner
+            try:
+                validated_data['school_id'] = owner.profile.school_id
+            except (UserProfile.DoesNotExist, AttributeError):
+                pass
+        else:
+            validated_data['created_by'] = request_user
+            try:
+                if request_user.profile.school_id:
+                    validated_data['school_id'] = request_user.profile.school_id
+            except (UserProfile.DoesNotExist, AttributeError):
+                pass
         validated_data['status'] = 'draft'
         exam = Exam.objects.create(**validated_data)
-        
+
         # Create exam questions
         for q_data in questions_data:
             ExamQuestion.objects.create(
@@ -178,9 +290,22 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
         # Check if exam can be edited
         if instance.status == 'frozen':
             raise serializers.ValidationError("Cannot edit a frozen exam")
-        
+
         questions_data = validated_data.pop('questions', None)
-        
+        owner_user_id = validated_data.pop('owner_user_id', None)
+        request_user = self.context['request'].user
+        try:
+            request_role = request_user.profile.role
+        except (UserProfile.DoesNotExist, AttributeError):
+            request_role = None
+        if owner_user_id is not None and request_role in (ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN):
+            owner = User.objects.get(pk=owner_user_id)
+            instance.created_by = owner
+            try:
+                instance.school_id = owner.profile.school_id
+            except (UserProfile.DoesNotExist, AttributeError):
+                pass
+
         # Update exam fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -206,10 +331,12 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
 
 
 class ParticipantSerializer(serializers.ModelSerializer):
+    owner_name = serializers.SerializerMethodField()
+
     class Meta:
         model = Participant
-        fields = ['id', 'name', 'email', 'clicker_id', 'extra', 'created_at']
-        read_only_fields = ['id', 'created_at']
+        fields = ['id', 'name', 'email', 'clicker_id', 'extra', 'created_at', 'owner_name']
+        read_only_fields = ['id', 'created_at', 'owner_name']
         extra_kwargs = {
             'name': {'required': True},
             'clicker_id': {'required': True},
@@ -221,11 +348,24 @@ class ParticipantSerializer(serializers.ModelSerializer):
         value = (value or '').strip()
         if not value:
             raise serializers.ValidationError('Clicker ID is required.')
+        # Uniqueness is per teacher (created_by), not global — matches scoped participant list API.
+        request = self.context.get('request')
+        user = getattr(request, 'user', None) if request else None
+        if self.instance is not None:
+            owner_id = self.instance.created_by_id
+        else:
+            owner_id = user.id if user and getattr(user, 'is_authenticated', False) else None
         qs = Participant.objects.filter(clicker_id=value)
+        if owner_id is not None:
+            qs = qs.filter(created_by_id=owner_id)
+        else:
+            qs = qs.filter(created_by__isnull=True)
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
-            raise serializers.ValidationError('Clicker ID already assigned.')
+            raise serializers.ValidationError(
+                'This clicker ID is already used by another participant in your roster.'
+            )
         return value
 
     def validate_name(self, value):
@@ -240,6 +380,13 @@ class ParticipantSerializer(serializers.ModelSerializer):
         if not isinstance(value, dict):
             return {}
         return {k: (v if v is None else str(v)) for k, v in value.items()}
+
+    def get_owner_name(self, obj):
+        user = getattr(obj, 'created_by', None)
+        if not user:
+            return None
+        name = (getattr(user, 'first_name', '') or '').strip() or (getattr(user, 'email', '') or '')
+        return name or str(user.id)
 
 
 class ParticipantBulkCreateSerializer(serializers.Serializer):
@@ -319,6 +466,14 @@ class QuestionAnalysisSerializer(serializers.Serializer):
     option_votes = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
 
 
+class ParticipantQuestionAnswerSerializer(serializers.Serializer):
+    """Per-question row for report API: labels match question option_display (alpha vs numeric)."""
+    question_id = serializers.IntegerField()
+    response = serializers.CharField(allow_blank=True)
+    correct_answer = serializers.CharField(allow_blank=True)
+    is_correct = serializers.BooleanField(allow_null=True)
+
+
 class ParticipantResultSerializer(serializers.Serializer):
     participant_id = serializers.IntegerField()
     participant_name = serializers.CharField()
@@ -344,7 +499,9 @@ class ParticipantResultSerializer(serializers.Serializer):
     wrong_answers = serializers.IntegerField()
     unattempted = serializers.IntegerField()
     percentage = serializers.FloatField()
+    time_taken = serializers.IntegerField()
     rank = serializers.IntegerField()
+    question_answers = ParticipantQuestionAnswerSerializer(many=True, required=False)
 
 
 class ExamReportSerializer(serializers.Serializer):
@@ -401,4 +558,64 @@ class LeaderboardSerializer(serializers.Serializer):
     exam_title = serializers.CharField()
     entries = LeaderboardEntrySerializer(many=True)
     generated_at = serializers.DateTimeField()
+
+
+# RBAC: Schools and user management
+class SchoolSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = School
+        fields = ['id', 'name', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+
+class CreateSchoolAdminSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, min_length=8)
+    name = serializers.CharField(required=False, allow_blank=True)
+    school_id = serializers.IntegerField()
+
+    def validate_school_id(self, value):
+        if not School.objects.filter(id=value).exists():
+            raise serializers.ValidationError('School not found.')
+        return value
+
+    def create(self, validated_data):
+        from django.contrib.auth.models import User
+        email = validated_data['email']
+        if User.objects.filter(email=email).exists():
+            raise serializers.ValidationError({'email': 'A user with this email already exists.'})
+        user = User.objects.create_user(
+            username=email,
+            email=email,
+            password=validated_data['password'],
+            first_name=validated_data.get('name') or email.split('@')[0],
+        )
+        UserProfile.objects.create(user=user, role=ROLE_SCHOOL_ADMIN, school_id=validated_data['school_id'])
+        return user
+
+
+class CreateTeacherSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, min_length=8)
+    name = serializers.CharField(required=False, allow_blank=True)
+    school_id = serializers.IntegerField()
+
+    def validate_school_id(self, value):
+        if not School.objects.filter(id=value).exists():
+            raise serializers.ValidationError('School not found.')
+        return value
+
+    def create(self, validated_data):
+        from django.contrib.auth.models import User
+        email = validated_data['email']
+        if User.objects.filter(email=email).exists():
+            raise serializers.ValidationError({'email': 'A user with this email already exists.'})
+        user = User.objects.create_user(
+            username=email,
+            email=email,
+            password=validated_data['password'],
+            first_name=validated_data.get('name') or email.split('@')[0],
+        )
+        UserProfile.objects.create(user=user, role=ROLE_TEACHER, school_id=validated_data['school_id'])
+        return user
 

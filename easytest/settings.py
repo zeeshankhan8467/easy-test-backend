@@ -17,8 +17,7 @@ SECRET_KEY = os.getenv('SECRET_KEY', 'django-insecure-change-this-in-production'
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 
-#ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,localhost:5174').split(',')
-ALLOWED_HOSTS = ['easytestlive.com','168.144.18.139', 'localhost', '127.0.0.1']
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1,127.0.0.1:5174').split(',')
 
 # Application definition
 INSTALLED_APPS = [
@@ -35,18 +34,17 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    "corsheaders.middleware.CorsMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    'django.middleware.security.SecurityMiddleware',
-    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
+    'django.middleware.security.SecurityMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+CORS_ALLOW_ALL_ORIGINS = True
 
 ROOT_URLCONF = 'easytest.urls'
 
@@ -81,8 +79,8 @@ else:
         'default': {
             'ENGINE': 'django.db.backends.mysql',
             'NAME': os.getenv('DB_NAME', 'easytest'),
-            'USER': os.getenv('DB_USER', 'easytestuser'),
-            'PASSWORD': os.getenv('DB_PASSWORD', 'StrongPassword123'),
+            'USER': os.getenv('DB_USER', 'root'),
+            'PASSWORD': os.getenv('DB_PASSWORD', ''),
             'HOST': os.getenv('DB_HOST', '127.0.0.1'),
             'PORT': os.getenv('DB_PORT', '3306'),
             'OPTIONS': {
@@ -149,10 +147,8 @@ SIMPLE_JWT = {
 # CORS Settings - allow frontend dev servers (localhost and 127.0.0.1)
 _default_origins = [
     'http://localhost:5173',
-    'http://localhost:5174',
     'http://localhost:3000',
     'http://127.0.0.1:5173',
-    'http://127.0.0.1:5174',
     'http://127.0.0.1:3000',
 ]
 CORS_ALLOWED_ORIGINS = [
@@ -168,5 +164,64 @@ CORS_ALLOW_CREDENTIALS = True
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
-CORS_ALLOW_ALL_ORIGINS = True
-CORS_ALLOW_CREDENTIALS = True
+# Email (SMTP)
+# If EMAIL_HOST is configured, we use SMTP even when DEBUG=True.
+_email_host_default = 'smtp.gmail.com'
+_email_port_default = '587'
+_email_use_tls_default = 'True'
+_email_host_user_default = 'easytest1988@gmail.com'
+# Gmail app passwords are sometimes pasted/shown as groups with spaces.
+# Store the default without whitespace, and also strip whitespace if loaded from env.
+_email_host_password_default = 'rxrdoenzbflnsnrb'
+_default_from_email_default = 'yourgmail@gmail.com'
+
+_email_host = (os.getenv('EMAIL_HOST', _email_host_default) or '').strip()
+_email_port = (os.getenv('EMAIL_PORT', _email_port_default) or '').strip()
+_email_host_user = (os.getenv('EMAIL_HOST_USER', _email_host_user_default) or '').strip()
+_email_host_password = (os.getenv('EMAIL_HOST_PASSWORD', _email_host_password_default) or '').strip()
+
+# Remove all whitespace so SMTP receives the correct raw password.
+_email_host_password = ''.join(_email_host_password.split())
+
+EMAIL_HOST = _email_host
+EMAIL_PORT = int(_email_port) if _email_port.isdigit() else 587
+EMAIL_HOST_USER = _email_host_user
+EMAIL_HOST_PASSWORD = _email_host_password
+EMAIL_USE_TLS = (os.getenv('EMAIL_USE_TLS', _email_use_tls_default) or '').strip().lower() in ('1', 'true', 'yes', 'on')
+DEFAULT_FROM_EMAIL = (os.getenv('DEFAULT_FROM_EMAIL', _default_from_email_default) or '').strip()
+
+# SMTP connect timeout (seconds). Keeps gunicorn workers from hanging on network blocks.
+EMAIL_TIMEOUT = int((os.getenv('EMAIL_TIMEOUT', '10') or '').strip() or '10')
+
+# Always use SMTP so the "send email to parent" feature works in dev.
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+
+# Logging: ensure our time-tracking debug logs from `api.views` are visible in dev.
+# Without this, Django's default logging often suppresses `logger.info(...)` output.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'simple': {
+            'format': '[{levelname}] {name}: {message}',
+            'style': '{',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'simple',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    },
+    'loggers': {
+        'api.views': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}

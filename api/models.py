@@ -4,6 +4,44 @@ from django.utils import timezone
 import json
 
 
+ROLE_SUPER_ADMIN = 'super_admin'
+ROLE_SCHOOL_ADMIN = 'school_admin'
+ROLE_TEACHER = 'teacher'
+ROLE_CHOICES = [
+    (ROLE_SUPER_ADMIN, 'Super Admin'),
+    (ROLE_SCHOOL_ADMIN, 'School Admin'),
+    (ROLE_TEACHER, 'Teacher'),
+]
+
+
+class School(models.Model):
+    """School/organization. School Admin and Teachers belong to a school."""
+    name = models.CharField(max_length=200)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class UserProfile(models.Model):
+    """RBAC: role and optional school for the user."""
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default=ROLE_TEACHER)
+    school = models.ForeignKey(
+        School, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='users'
+    )
+
+    class Meta:
+        ordering = ['user__email']
+
+    def __str__(self):
+        return f'{self.user.email} ({self.get_role_display()})'
+
+
 class Exam(models.Model):
     STATUS_CHOICES = [
         ('draft', 'Draft'),
@@ -15,6 +53,18 @@ class Exam(models.Model):
     description = models.TextField(blank=True, null=True)
     duration = models.IntegerField(help_text="Duration in seconds allowed per question (for session timer)")
     revisable = models.BooleanField(default=True, help_text="Allow participants to revise answers")
+    show_live_response = models.BooleanField(
+        default=False,
+        help_text="If true, show live response/option selection while participants are answering."
+    )
+    show_response_after_completion = models.BooleanField(
+        default=True,
+        help_text="If true, show full responses/options after all participants complete."
+    )
+    question_change_automatic = models.BooleanField(
+        default=False,
+        help_text="If true, questions auto-advance during live exam. If false, question change is manual."
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
     # Legacy fields - kept for backward compatibility, but question-wise marks are now in ExamQuestion
     positive_marking = models.DecimalField(max_digits=5, decimal_places=2, default=1.0)
@@ -23,6 +73,10 @@ class Exam(models.Model):
     snapshot_data = models.JSONField(null=True, blank=True, help_text="Immutable snapshot when frozen")
     snapshot_version = models.CharField(max_length=50, blank=True, help_text="Version/checksum of snapshot")
     created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_exams')
+    school = models.ForeignKey(
+        School, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='exams', help_text='School this exam belongs to (for RBAC)'
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -79,6 +133,9 @@ class Question(models.Model):
     difficulty = models.CharField(max_length=10, choices=DIFFICULTY_LEVELS, default='medium')
     tags = models.JSONField(default=list, blank=True)
     marks = models.DecimalField(max_digits=5, decimal_places=2, default=1.0, help_text="Marks/points for this question")
+    image_url = models.URLField(max_length=2000, blank=True, help_text="Optional image URL to display with the question")
+    video_url = models.URLField(max_length=2000, blank=True, help_text="Optional video URL (YouTube, Vimeo, or direct video link)")
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_questions', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -111,15 +168,56 @@ class ExamQuestion(models.Model):
 class Participant(models.Model):
     name = models.CharField(max_length=200)
     email = models.EmailField(blank=True, null=True, unique=True)  # optional
-    clicker_id = models.CharField(max_length=50, unique=True)  # required
+    # Unique per owner (teacher), not globally — different teachers may use the same keypad IDs.
+    clicker_id = models.CharField(max_length=50)
+    school = models.ForeignKey(
+        School, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='participants', help_text='School this participant belongs to (for RBAC)'
+    )
     extra = models.JSONField(default=dict, blank=True, help_text='Custom fields: email, rollno, class, gender, etc.')
+    created_by = models.ForeignKey(User, on_delete=models.CASCADE, related_name='created_participants', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ['clicker_id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['created_by', 'clicker_id'],
+                name='uniq_participant_created_by_clicker_id',
+            ),
+        ]
 
     def __str__(self):
         return self.name
+
+
+class DailyAttendance(models.Model):
+    """Attendance for a participant on a calendar day — independent of exams."""
+    participant = models.ForeignKey(
+        Participant, on_delete=models.CASCADE, related_name='daily_attendance_records'
+    )
+    date = models.DateField(db_index=True)
+    present = models.BooleanField(default=False)
+    recorded_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='recorded_daily_attendance'
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-date', 'participant_id']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['participant', 'date'],
+                name='uniq_daily_attendance_participant_date',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['date', 'participant']),
+        ]
+
+    def __str__(self):
+        return f'{self.participant_id} {self.date} {"P" if self.present else "A"}'
 
 
 class ExamParticipant(models.Model):
@@ -166,7 +264,8 @@ class Answer(models.Model):
     selected_answer = models.JSONField(help_text="Selected answer index or indices")
     is_correct = models.BooleanField(default=False)
     time_taken = models.IntegerField(default=0, help_text="Time taken for this question in seconds")
-    answered_at = models.DateTimeField(auto_now_add=True)
+    # Client-reported instant (live sync); not auto_now so sync can persist clicker timestamps.
+    answered_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         unique_together = ['attempt', 'question']
