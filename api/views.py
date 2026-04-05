@@ -2692,53 +2692,37 @@ def _participant_report_row(participant):
 
 
 def _seconds_per_attempt_from_answers(exam):
-    """Total time per attempt = sum(Answer.time_taken); same basis as leaderboard and report totals."""
-    rows = (
-        Answer.objects.filter(attempt__exam=exam)
-        .values('attempt_id')
-        .annotate(total=Sum('time_taken'))
-    )
+    """
+    Total seconds per attempt = sum of each Answer.time_taken (same rows as report Speed column).
+
+    We sum in Python from values_list instead of SQL Sum+GROUP BY so production MySQL/MariaDB
+    cannot return a wrong aggregate or a key type that breaks lookup — leaderboard was showing
+    e.g. 26 while per-question speeds 5+3+2+4=14.
+    """
+    rows = Answer.objects.filter(attempt__exam=exam).values_list('attempt_id', 'time_taken')
     out = {}
-    for r in rows:
-        aid = r.get('attempt_id')
+    for aid, tt in rows:
         if aid is None:
             continue
         try:
             k = int(aid)
         except (TypeError, ValueError):
             continue
-        tot = r.get('total')
         try:
-            if tot is None:
-                v = 0
-            else:
-                v = int(tot)
+            sec = max(0, int(tt)) if tt is not None else 0
         except (TypeError, ValueError):
             try:
-                v = int(float(tot))
+                sec = max(0, int(float(tt)))
             except (TypeError, ValueError):
-                v = 0
-        out[k] = max(0, v)
+                sec = 0
+        out[k] = out.get(k, 0) + sec
     return out
 
 
 def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
-    """
-    Prefer sum of Answer.time_taken (same as per-question Speed in exports).
-    Use int attempt pk for lookup: some DB drivers return attempt_id from GROUP BY as a
-    different numeric type, so `attempt.id in dict` was False and we incorrectly fell back
-    to ExamAttempt.time_taken (stale total e.g. 26 while answers sum to 5+3+2+4).
-    """
+    """Total time = sum of Answer.time_taken for this attempt (same rows as report Speed). No ExamAttempt.time_taken — keeps leaderboard and report identical."""
     k = int(attempt.pk)
-    if k in seconds_from_answers:
-        return seconds_from_answers[k]
-    agg = Answer.objects.filter(attempt_id=k).aggregate(s=Sum('time_taken'))['s']
-    if agg is not None:
-        try:
-            return max(0, int(agg))
-        except (TypeError, ValueError):
-            return max(0, int(float(agg)))
-    return max(0, int(attempt.time_taken or 0))
+    return max(0, int(seconds_from_answers.get(k, 0)))
 
 
 def _get_exam_report_data(exam):
