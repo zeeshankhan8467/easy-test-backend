@@ -845,8 +845,15 @@ class ExamViewSet(viewsets.ModelViewSet):
             attempt.score = total_marks
             attempt.submitted_at = timezone.now()
             if answers.exists():
-                # Sum per-question seconds so leaderboard / exports match "Speed" column totals.
-                attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
+                # Sum only current exam questions so DB matches Speed column / leaderboard.
+                qids = set(exam.exam_questions.values_list('question_id', flat=True))
+                if qids:
+                    attempt.time_taken = max(
+                        0,
+                        sum(a.time_taken or 0 for a in answers if a.question_id in qids),
+                    )
+                else:
+                    attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
             attempt.save()
 
         # Assign all listed participants to the exam and mark present those who responded
@@ -2693,13 +2700,22 @@ def _participant_report_row(participant):
 
 def _seconds_per_attempt_from_answers(exam):
     """
-    Total seconds per attempt = sum of each Answer.time_taken (same rows as report Speed column).
+    Total seconds per attempt = sum of Answer.time_taken for questions still on this exam.
+
+    Must match Excel/API "Speed" rows: those iterate exam_questions only. Answers tied to
+    question_ids no longer on the exam (removed/replaced after the live session) were inflating
+    leaderboard (e.g. 36s) vs summing visible Speed cells (e.g. 5+6+7+8).
 
     We sum in Python from values_list instead of SQL Sum+GROUP BY so production MySQL/MariaDB
-    cannot return a wrong aggregate or a key type that breaks lookup — leaderboard was showing
-    e.g. 26 while per-question speeds 5+3+2+4=14.
+    cannot return a wrong aggregate or a key type that breaks lookup.
     """
-    rows = Answer.objects.filter(attempt__exam=exam).values_list('attempt_id', 'time_taken')
+    qids = list(exam.exam_questions.values_list('question_id', flat=True))
+    if not qids:
+        return {}
+    rows = Answer.objects.filter(
+        attempt__exam=exam,
+        question_id__in=qids,
+    ).values_list('attempt_id', 'time_taken')
     out = {}
     for aid, tt in rows:
         if aid is None:
@@ -2720,7 +2736,7 @@ def _seconds_per_attempt_from_answers(exam):
 
 
 def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
-    """Total time = sum of Answer.time_taken for this attempt (same rows as report Speed). No ExamAttempt.time_taken — keeps leaderboard and report identical."""
+    """Total time = sum of Answer.time_taken for this attempt (current exam questions only — same as report Speed)."""
     k = int(attempt.pk)
     return max(0, int(seconds_from_answers.get(k, 0)))
 
