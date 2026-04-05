@@ -16,6 +16,7 @@ from django.db.models import Q, Count, Avg, Max, Min, Sum
 from django.db.models.functions import Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET
 from django.core.mail import EmailMessage, get_connection
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -39,6 +40,35 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_live_sync_datetime(raw):
+    """
+    Parse ISO datetimes from EasyTest Live / clients that use IST (+05:30) in payloads.
+
+    If the string has no timezone (naive), treat wall time as Asia/Kolkata — not as
+    Django's default TIME_ZONE (often UTC). Otherwise naive values meant as IST are
+    stored ~5.5h wrong and computed time_taken (when client omits time_taken) breaks on prod.
+    """
+    if raw is None or raw == '':
+        return None
+    s = str(raw).strip().replace('Z', '+00:00')
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    ist = ZoneInfo('Asia/Kolkata')
+    dt = parse_datetime(s)
+    if dt is None:
+        try:
+            from datetime import datetime as dt_mod
+            dt = dt_mod.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, ist)
+    return dt
+
 
 def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
     """
@@ -525,16 +555,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         responses_data = request.data.get('responses', [])
         attendance_ids = request.data.get('attendance', [])
         exam_started_at_raw = request.data.get('exam_started_at')
-        exam_started_at_parsed = None
-        if exam_started_at_raw:
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(str(exam_started_at_raw).replace('Z', '+00:00'))
-                if timezone.is_naive(dt):
-                    dt = timezone.make_aware(dt)
-                exam_started_at_parsed = dt
-            except (ValueError, TypeError):
-                pass
+        exam_started_at_parsed = _parse_live_sync_datetime(exam_started_at_raw)
         logger.info(
             '[sync_live_results] TIME_TAKEN DEBUG: exam_started_at raw=%s parsed=%s',
             exam_started_at_raw, exam_started_at_parsed
@@ -545,16 +566,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         )
 
         def _parse_answered_at_for_sync(raw):
-            if not raw:
-                return None
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
-                if timezone.is_naive(dt):
-                    dt = timezone.make_aware(dt)
-                return dt
-            except (ValueError, TypeError):
-                return None
+            return _parse_live_sync_datetime(raw)
 
         def _response_chronological_key(item):
             dt = _parse_answered_at_for_sync(item.get('answered_at'))
@@ -745,9 +757,10 @@ class ExamViewSet(viewsets.ModelViewSet):
             answered_dt = _parse_answered_at_for_sync(item.get('answered_at'))
             time_taken = 0
             used_client_time = False
-            if 'time_taken' in item:
+            tt_raw = item.get('time_taken')
+            if tt_raw is not None:
                 try:
-                    time_taken = max(0, int(item.get('time_taken')))
+                    time_taken = max(0, int(float(tt_raw)))
                     used_client_time = True
                 except (TypeError, ValueError):
                     used_client_time = False
