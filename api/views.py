@@ -171,11 +171,21 @@ def _msg91_send_whatsapp_template(recipient_number: str, body_vars: dict) -> dic
     if body_vars is None or not isinstance(body_vars, dict):
         body_vars = {}
 
+    def _msg91_template_value(raw) -> str:
+        """
+        MSG91 template body values do not support newline characters.
+        Normalize any multiline text into a single line with spaces.
+        """
+        text = str(raw or "")
+        text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        # Collapse repeated whitespace after newline replacement.
+        return " ".join(text.split())
+
     # MSG91 expects body_N keys under "components". We only include provided values.
     components = {}
     for k in ("body_1", "body_2", "body_3", "body_4"):
         if k in body_vars and body_vars.get(k) is not None:
-            components[k] = {"type": "text", "value": str(body_vars.get(k))}
+            components[k] = {"type": "text", "value": _msg91_template_value(body_vars.get(k))}
     if not components:
         # Keep API contract consistent: at least body_1 must exist for most templates.
         components["body_1"] = {"type": "text", "value": ""}
