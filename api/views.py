@@ -1861,40 +1861,40 @@ class QuestionViewSet(viewsets.ModelViewSet):
             option_display = 'alpha'
 
         try:
-            # Try AI generation: Groq first, then Gemini (free), then OpenAI
+            # AI generation order: env QUESTION_AI_PROVIDERS (comma-separated: openai, groq, gemini)
+            _raw_order = (os.getenv('QUESTION_AI_PROVIDERS') or 'openai,groq,gemini').strip().lower()
+            _provider_order = [
+                p.strip() for p in _raw_order.split(',')
+                if p.strip() in ('groq', 'gemini', 'openai')
+            ]
+            if not _provider_order:
+                _provider_order = ['openai', 'groq', 'gemini']
+
             ai_questions = []
             provider_used = None
-            try:
-                from api.services.ai_generator_groq import GroqQuestionGenerator
-                generator = GroqQuestionGenerator()
-                ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
+            for prov in _provider_order:
                 if ai_questions:
-                    provider_used = 'Groq'
-            except (ValueError, ImportError) as e:
-                logger.info("AI generate: Groq not used (%s)", e)
-                pass
-
-            if not ai_questions:
+                    break
                 try:
-                    from api.services.ai_generator_gemini import GeminiQuestionGenerator
-                    generator = GeminiQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
+                    if prov == 'groq':
+                        from api.services.ai_generator_groq import GroqQuestionGenerator
+                        generator = GroqQuestionGenerator()
+                        label = 'Groq'
+                    elif prov == 'gemini':
+                        from api.services.ai_generator_gemini import GeminiQuestionGenerator
+                        generator = GeminiQuestionGenerator()
+                        label = 'Gemini'
+                    else:
+                        from api.services.ai_generator import AIQuestionGenerator
+                        generator = AIQuestionGenerator()
+                        label = 'OpenAI'
+                    ai_questions = generator.generate_questions_safe(
+                        topic, count, difficulty, qtype, num_options=num_options
+                    )
                     if ai_questions:
-                        provider_used = 'Gemini'
+                        provider_used = label
                 except (ValueError, ImportError) as e:
-                    logger.info("AI generate: Gemini not used (%s)", e)
-                    pass
-
-            if not ai_questions:
-                try:
-                    from api.services.ai_generator import AIQuestionGenerator
-                    generator = AIQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
-                    if ai_questions:
-                        provider_used = 'OpenAI'
-                except (ValueError, ImportError) as e:
-                    logger.info("AI generate: OpenAI not used (%s)", e)
-                    pass
+                    logger.info("AI generate: %s not used (%s)", prov, e)
 
             # If AI generation succeeded and returned questions
             if ai_questions:
@@ -1929,13 +1929,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 )
                 print(
                     "[EasyTest AI] No API key configured or AI returned no questions. "
-                    "Using sample questions. For real AI: add GROQ_API_KEY or GEMINI_API_KEY to .env (see FREE_AI_SETUP.md)"
+                    "Using sample questions. For real AI: set QUESTION_AI_PROVIDERS and add GROQ_API_KEY, GEMINI_API_KEY, and/or OPENAI_API_KEY in .env (see FREE_AI_SETUP.md)"
                 )
                 mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
                 return Response(
                     {
                         'questions': mock_data,
-                        'warning': 'AI generation unavailable. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI (see FREE_AI_SETUP.md).'
+                        'warning': 'AI generation unavailable. Sample questions generated. Configure QUESTION_AI_PROVIDERS and GROQ_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY in .env (see FREE_AI_SETUP.md).'
                     },
                     status=status.HTTP_201_CREATED
                 )
@@ -1945,13 +1945,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
             logger.warning("AI generate: ValueError (e.g. missing API key): %s", e)
             print(
                 "[EasyTest AI] API key not set. Using sample questions. "
-                "Add GROQ_API_KEY or GEMINI_API_KEY to backend .env (see FREE_AI_SETUP.md)"
+                "Add OPENAI_API_KEY and/or GROQ_API_KEY / GEMINI_API_KEY to backend .env (see FREE_AI_SETUP.md). Use QUESTION_AI_PROVIDERS=openai to prefer GPT."
             )
             mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
             return Response(
                 {
                     'questions': mock_data,
-                    'warning': 'API key not configured. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI.'
+                    'warning': 'API key not configured. Sample questions generated. Add OPENAI_API_KEY (and QUESTION_AI_PROVIDERS=openai if desired) or GROQ / GEMINI keys in .env.'
                 },
                 status=status.HTTP_201_CREATED
             )
