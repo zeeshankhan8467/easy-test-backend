@@ -133,11 +133,11 @@ def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
         raise RuntimeError(f'Msg91 request failed: {str(e)}')
 
 
-def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
+def _msg91_send_whatsapp_template(recipient_number: str, body_vars: dict) -> dict:
     """
-    Send WhatsApp outbound message using a pre-approved WhatsApp template (single body component).
+    Send WhatsApp outbound message using a pre-approved WhatsApp template.
 
-    This code assumes your template's body has exactly ONE dynamic variable, and MSG91 will map it to `body_1`.
+    Supports templates with body variables: body_1, body_2, body_3, body_4 (send only those provided).
 
     Required env vars:
       - MSG91_AUTHKEY
@@ -168,10 +168,18 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
         raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_OUTBOUND_URL in environment.')
     if not recipient_number:
         raise ValueError('Missing recipient_number.')
-    if text is None:
-        text = ''
+    if body_vars is None or not isinstance(body_vars, dict):
+        body_vars = {}
 
-    # We send the full rendered message as the single body parameter (body_1).
+    # MSG91 expects body_N keys under "components". We only include provided values.
+    components = {}
+    for k in ("body_1", "body_2", "body_3", "body_4"):
+        if k in body_vars and body_vars.get(k) is not None:
+            components[k] = {"type": "text", "value": str(body_vars.get(k))}
+    if not components:
+        # Keep API contract consistent: at least body_1 must exist for most templates.
+        components["body_1"] = {"type": "text", "value": ""}
+
     payload = {
         'integrated_number': integrated_number,
         'content_type': 'template',
@@ -188,12 +196,7 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
                 'to_and_components': [
                     {
                         'to': [recipient_number],
-                        'components': {
-                            'body_1': {
-                                'type': 'text',
-                                'value': text,
-                            }
-                        },
+                        'components': components,
                     }
                 ],
             }
@@ -231,14 +234,14 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
         raise RuntimeError(f'Msg91 request failed: {str(e)}')
 
 
-def _msg91_send_whatsapp_message(recipient_number: str, text: str) -> dict:
+def _msg91_send_whatsapp_message(recipient_number: str, text: str, body_vars: dict | None = None) -> dict:
     """
     Choose template-based sending if template env vars are configured,
     otherwise fall back to text sending.
     """
     template_name = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip()
     return (
-        _msg91_send_whatsapp_template(recipient_number, text)
+        _msg91_send_whatsapp_template(recipient_number, body_vars or {'body_1': text})
         if template_name
         else _msg91_send_whatsapp_text(recipient_number, text)
     )
@@ -1111,11 +1114,12 @@ class ExamViewSet(viewsets.ModelViewSet):
         scope = (request.data.get('scope') or 'absent').strip().lower()
         participant_ids = request.data.get('participant_ids', None)
         message = (request.data.get('message') or '').strip()
+        template_enabled = bool((os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip())
         if scope not in ('present', 'absent', 'all'):
             return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
         if participant_ids is not None and not isinstance(participant_ids, list):
             return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
-        if not message:
+        if not message and not template_enabled:
             return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Fail fast if msg91 is not configured
@@ -1187,8 +1191,19 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'status': 'Present' if is_present else 'Absent',
             }
             try:
-                text = _render(message, ctx)
-                resp = _msg91_send_whatsapp_message(phone, text)
+                # If template mode: map to body_1..body_4 for your approved template.
+                if template_enabled:
+                    body_1 = _render(message, ctx) if message else (exam.title or "")
+                    body_vars = {
+                        "body_1": body_1,
+                        "body_2": p.name or "",
+                        "body_3": p.clicker_id or "",
+                        "body_4": 'Present' if is_present else 'Absent',
+                    }
+                    resp = _msg91_send_whatsapp_message(phone, body_1, body_vars=body_vars)
+                else:
+                    text = _render(message, ctx)
+                    resp = _msg91_send_whatsapp_message(phone, text)
                 msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
                 messages.append({
                     'participant_id': p.id,
@@ -1582,11 +1597,12 @@ def daily_attendance_send_parent_whatsapp(request):
     scope = ((request.data or {}).get('scope') or 'absent').strip().lower()
     participant_ids = (request.data or {}).get('participant_ids', None)
     message = ((request.data or {}).get('message') or '').strip()
+    template_enabled = bool((os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip())
     if scope not in ('present', 'absent', 'all', 'unmarked'):
         return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
     if participant_ids is not None and not isinstance(participant_ids, list):
         return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
-    if not message:
+    if not message and not template_enabled:
         return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
 
     # Fail fast if msg91 is not configured
@@ -1665,8 +1681,19 @@ def daily_attendance_send_parent_whatsapp(request):
             'status': status_human,
         }
         try:
-            text = _render(message, ctx)
-            resp = _msg91_send_whatsapp_message(phone, text)
+            if template_enabled:
+                # body_1 should be the "Attendance update for ..." value; default to attendance date.
+                body_1 = _render(message, ctx) if message else attendance_date_label
+                body_vars = {
+                    "body_1": body_1,
+                    "body_2": p.name or "",
+                    "body_3": p.clicker_id or "",
+                    "body_4": status_human,
+                }
+                resp = _msg91_send_whatsapp_message(phone, body_1, body_vars=body_vars)
+            else:
+                text = _render(message, ctx)
+                resp = _msg91_send_whatsapp_message(phone, text)
             msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
             messages.append({
                 'participant_id': p.id,
