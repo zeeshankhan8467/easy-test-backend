@@ -2212,13 +2212,15 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             if tid is not None:
                 base_qs = base_qs.filter(created_by_id=tid)
         if exam_id:
+            # Validate the exam is visible to the logged-in user.
+            # For participant listing, return the user's scoped participants
+            # rather than only exam-assigned participants.
             exam_qs = scope_exams_queryset(Exam.objects.all(), user)
             try:
-                exam = exam_qs.get(id=exam_id)
+                exam_qs.get(id=exam_id)
             except Exam.DoesNotExist:
                 return Participant.objects.none()
-            participant_ids = ExamParticipant.objects.filter(exam=exam).values_list('participant_id', flat=True)
-            return base_qs.filter(id__in=participant_ids).order_by(*base_order)
+            return base_qs.order_by(*base_order)
         return base_qs.order_by(*base_order)
 
     def perform_create(self, serializer):
