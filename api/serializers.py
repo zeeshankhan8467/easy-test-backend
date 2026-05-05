@@ -128,7 +128,7 @@ class ExamSerializer(serializers.ModelSerializer):
         user = getattr(request, 'user', None) if request else None
         if not user or not user.is_authenticated:
             return 0
-        return obj.exam_participants.filter(participant__created_by=user).count()
+        return Participant.objects.filter(created_by=user).count()
 
     def get_total_marks(self, obj):
         return float(obj.total_marks)
