@@ -337,7 +337,10 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Allow creating exam without questions (draft mode)
         # Questions can be added later before freezing
         exam = serializer.save()
-        return Response(ExamSerializer(exam).data, status=status.HTTP_201_CREATED)
+        return Response(
+            ExamSerializer(exam, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
     
     def update(self, request, *args, **kwargs):
         exam = self.get_object()
@@ -355,7 +358,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Allow removing all questions (draft mode)
         # But validate before freezing
         exam = serializer.save()
-        return Response(ExamSerializer(exam).data)
+        return Response(ExamSerializer(exam, context={'request': request}).data)
 
     @action(detail=True, methods=['post'])
     def freeze(self, request, pk=None):
@@ -428,7 +431,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.snapshot_version = snapshot_version
         exam.save()
         
-        return Response(ExamSerializer(exam).data)
+        return Response(ExamSerializer(exam, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='export')
     def export_report_action(self, request, pk=None):
