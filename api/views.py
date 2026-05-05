@@ -16,6 +16,7 @@ from django.db.models import Q, Count, Avg, Max, Min, Sum
 from django.db.models.functions import Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET
 from django.core.mail import EmailMessage, get_connection
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -39,6 +40,35 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_live_sync_datetime(raw):
+    """
+    Parse ISO datetimes from EasyTest Live / clients that use IST (+05:30) in payloads.
+
+    If the string has no timezone (naive), treat wall time as Asia/Kolkata — not as
+    Django's default TIME_ZONE (often UTC). Otherwise naive values meant as IST are
+    stored ~5.5h wrong and computed time_taken (when client omits time_taken) breaks on prod.
+    """
+    if raw is None or raw == '':
+        return None
+    s = str(raw).strip().replace('Z', '+00:00')
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    ist = ZoneInfo('Asia/Kolkata')
+    dt = parse_datetime(s)
+    if dt is None:
+        try:
+            from datetime import datetime as dt_mod
+            dt = dt_mod.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, ist)
+    return dt
+
 
 def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
     """
@@ -103,11 +133,11 @@ def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
         raise RuntimeError(f'Msg91 request failed: {str(e)}')
 
 
-def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
+def _msg91_send_whatsapp_template(recipient_number: str, body_vars: dict) -> dict:
     """
-    Send WhatsApp outbound message using a pre-approved WhatsApp template (single body component).
+    Send WhatsApp outbound message using a pre-approved WhatsApp template.
 
-    This code assumes your template's body has exactly ONE dynamic variable, and MSG91 will map it to `body_1`.
+    Supports templates with body variables: body_1, body_2, body_3, body_4 (send only those provided).
 
     Required env vars:
       - MSG91_AUTHKEY
@@ -138,10 +168,28 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
         raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_OUTBOUND_URL in environment.')
     if not recipient_number:
         raise ValueError('Missing recipient_number.')
-    if text is None:
-        text = ''
+    if body_vars is None or not isinstance(body_vars, dict):
+        body_vars = {}
 
-    # We send the full rendered message as the single body parameter (body_1).
+    def _msg91_template_value(raw) -> str:
+        """
+        MSG91 template body values do not support newline characters.
+        Normalize any multiline text into a single line with spaces.
+        """
+        text = str(raw or "")
+        text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        # Collapse repeated whitespace after newline replacement.
+        return " ".join(text.split())
+
+    # MSG91 expects body_N keys under "components". We only include provided values.
+    components = {}
+    for k in ("body_1", "body_2", "body_3", "body_4"):
+        if k in body_vars and body_vars.get(k) is not None:
+            components[k] = {"type": "text", "value": _msg91_template_value(body_vars.get(k))}
+    if not components:
+        # Keep API contract consistent: at least body_1 must exist for most templates.
+        components["body_1"] = {"type": "text", "value": ""}
+
     payload = {
         'integrated_number': integrated_number,
         'content_type': 'template',
@@ -158,12 +206,7 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
                 'to_and_components': [
                     {
                         'to': [recipient_number],
-                        'components': {
-                            'body_1': {
-                                'type': 'text',
-                                'value': text,
-                            }
-                        },
+                        'components': components,
                     }
                 ],
             }
@@ -201,14 +244,14 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
         raise RuntimeError(f'Msg91 request failed: {str(e)}')
 
 
-def _msg91_send_whatsapp_message(recipient_number: str, text: str) -> dict:
+def _msg91_send_whatsapp_message(recipient_number: str, text: str, body_vars: dict | None = None) -> dict:
     """
     Choose template-based sending if template env vars are configured,
     otherwise fall back to text sending.
     """
     template_name = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip()
     return (
-        _msg91_send_whatsapp_template(recipient_number, text)
+        _msg91_send_whatsapp_template(recipient_number, body_vars or {'body_1': text})
         if template_name
         else _msg91_send_whatsapp_text(recipient_number, text)
     )
@@ -294,7 +337,10 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Allow creating exam without questions (draft mode)
         # Questions can be added later before freezing
         exam = serializer.save()
-        return Response(ExamSerializer(exam).data, status=status.HTTP_201_CREATED)
+        return Response(
+            ExamSerializer(exam, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
     
     def update(self, request, *args, **kwargs):
         exam = self.get_object()
@@ -312,7 +358,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Allow removing all questions (draft mode)
         # But validate before freezing
         exam = serializer.save()
-        return Response(ExamSerializer(exam).data)
+        return Response(ExamSerializer(exam, context={'request': request}).data)
 
     @action(detail=True, methods=['post'])
     def freeze(self, request, pk=None):
@@ -385,7 +431,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.snapshot_version = snapshot_version
         exam.save()
         
-        return Response(ExamSerializer(exam).data)
+        return Response(ExamSerializer(exam, context={'request': request}).data)
 
     @action(detail=True, methods=['get'], url_path='export')
     def export_report_action(self, request, pk=None):
@@ -525,16 +571,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         responses_data = request.data.get('responses', [])
         attendance_ids = request.data.get('attendance', [])
         exam_started_at_raw = request.data.get('exam_started_at')
-        exam_started_at_parsed = None
-        if exam_started_at_raw:
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(str(exam_started_at_raw).replace('Z', '+00:00'))
-                if timezone.is_naive(dt):
-                    dt = timezone.make_aware(dt)
-                exam_started_at_parsed = dt
-            except (ValueError, TypeError):
-                pass
+        exam_started_at_parsed = _parse_live_sync_datetime(exam_started_at_raw)
         logger.info(
             '[sync_live_results] TIME_TAKEN DEBUG: exam_started_at raw=%s parsed=%s',
             exam_started_at_raw, exam_started_at_parsed
@@ -545,16 +582,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         )
 
         def _parse_answered_at_for_sync(raw):
-            if not raw:
-                return None
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
-                if timezone.is_naive(dt):
-                    dt = timezone.make_aware(dt)
-                return dt
-            except (ValueError, TypeError):
-                return None
+            return _parse_live_sync_datetime(raw)
 
         def _response_chronological_key(item):
             dt = _parse_answered_at_for_sync(item.get('answered_at'))
@@ -745,9 +773,10 @@ class ExamViewSet(viewsets.ModelViewSet):
             answered_dt = _parse_answered_at_for_sync(item.get('answered_at'))
             time_taken = 0
             used_client_time = False
-            if 'time_taken' in item:
+            tt_raw = item.get('time_taken')
+            if tt_raw is not None:
                 try:
-                    time_taken = max(0, int(item.get('time_taken')))
+                    time_taken = max(0, int(float(tt_raw)))
                     used_client_time = True
                 except (TypeError, ValueError):
                     used_client_time = False
@@ -832,8 +861,15 @@ class ExamViewSet(viewsets.ModelViewSet):
             attempt.score = total_marks
             attempt.submitted_at = timezone.now()
             if answers.exists():
-                # Sum per-question seconds so leaderboard / exports match "Speed" column totals.
-                attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
+                # Sum only current exam questions so DB matches Speed column / leaderboard.
+                qids = set(exam.exam_questions.values_list('question_id', flat=True))
+                if qids:
+                    attempt.time_taken = max(
+                        0,
+                        sum(a.time_taken or 0 for a in answers if a.question_id in qids),
+                    )
+                else:
+                    attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
             attempt.save()
 
         # Assign all listed participants to the exam and mark present those who responded
@@ -1091,11 +1127,12 @@ class ExamViewSet(viewsets.ModelViewSet):
         scope = (request.data.get('scope') or 'absent').strip().lower()
         participant_ids = request.data.get('participant_ids', None)
         message = (request.data.get('message') or '').strip()
+        template_enabled = bool((os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip())
         if scope not in ('present', 'absent', 'all'):
             return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
         if participant_ids is not None and not isinstance(participant_ids, list):
             return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
-        if not message:
+        if not message and not template_enabled:
             return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Fail fast if msg91 is not configured
@@ -1167,8 +1204,19 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'status': 'Present' if is_present else 'Absent',
             }
             try:
-                text = _render(message, ctx)
-                resp = _msg91_send_whatsapp_message(phone, text)
+                # If template mode: map to body_1..body_4 for your approved template.
+                if template_enabled:
+                    body_1 = _render(message, ctx) if message else (exam.title or "")
+                    body_vars = {
+                        "body_1": body_1,
+                        "body_2": p.name or "",
+                        "body_3": p.clicker_id or "",
+                        "body_4": 'Present' if is_present else 'Absent',
+                    }
+                    resp = _msg91_send_whatsapp_message(phone, body_1, body_vars=body_vars)
+                else:
+                    text = _render(message, ctx)
+                    resp = _msg91_send_whatsapp_message(phone, text)
                 msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
                 messages.append({
                     'participant_id': p.id,
@@ -1562,11 +1610,12 @@ def daily_attendance_send_parent_whatsapp(request):
     scope = ((request.data or {}).get('scope') or 'absent').strip().lower()
     participant_ids = (request.data or {}).get('participant_ids', None)
     message = ((request.data or {}).get('message') or '').strip()
+    template_enabled = bool((os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip())
     if scope not in ('present', 'absent', 'all', 'unmarked'):
         return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
     if participant_ids is not None and not isinstance(participant_ids, list):
         return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
-    if not message:
+    if not message and not template_enabled:
         return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
 
     # Fail fast if msg91 is not configured
@@ -1645,8 +1694,19 @@ def daily_attendance_send_parent_whatsapp(request):
             'status': status_human,
         }
         try:
-            text = _render(message, ctx)
-            resp = _msg91_send_whatsapp_message(phone, text)
+            if template_enabled:
+                # body_1 should be the "Attendance update for ..." value; default to attendance date.
+                body_1 = _render(message, ctx) if message else attendance_date_label
+                body_vars = {
+                    "body_1": body_1,
+                    "body_2": p.name or "",
+                    "body_3": p.clicker_id or "",
+                    "body_4": status_human,
+                }
+                resp = _msg91_send_whatsapp_message(phone, body_1, body_vars=body_vars)
+            else:
+                text = _render(message, ctx)
+                resp = _msg91_send_whatsapp_message(phone, text)
             msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
             messages.append({
                 'participant_id': p.id,
@@ -1841,40 +1901,40 @@ class QuestionViewSet(viewsets.ModelViewSet):
             option_display = 'alpha'
 
         try:
-            # Try AI generation: Groq first, then Gemini (free), then OpenAI
+            # AI generation order: env QUESTION_AI_PROVIDERS (comma-separated: openai, groq, gemini)
+            _raw_order = (os.getenv('QUESTION_AI_PROVIDERS') or 'openai,groq,gemini').strip().lower()
+            _provider_order = [
+                p.strip() for p in _raw_order.split(',')
+                if p.strip() in ('groq', 'gemini', 'openai')
+            ]
+            if not _provider_order:
+                _provider_order = ['openai', 'groq', 'gemini']
+
             ai_questions = []
             provider_used = None
-            try:
-                from api.services.ai_generator_groq import GroqQuestionGenerator
-                generator = GroqQuestionGenerator()
-                ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
+            for prov in _provider_order:
                 if ai_questions:
-                    provider_used = 'Groq'
-            except (ValueError, ImportError) as e:
-                logger.info("AI generate: Groq not used (%s)", e)
-                pass
-
-            if not ai_questions:
+                    break
                 try:
-                    from api.services.ai_generator_gemini import GeminiQuestionGenerator
-                    generator = GeminiQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
+                    if prov == 'groq':
+                        from api.services.ai_generator_groq import GroqQuestionGenerator
+                        generator = GroqQuestionGenerator()
+                        label = 'Groq'
+                    elif prov == 'gemini':
+                        from api.services.ai_generator_gemini import GeminiQuestionGenerator
+                        generator = GeminiQuestionGenerator()
+                        label = 'Gemini'
+                    else:
+                        from api.services.ai_generator import AIQuestionGenerator
+                        generator = AIQuestionGenerator()
+                        label = 'OpenAI'
+                    ai_questions = generator.generate_questions_safe(
+                        topic, count, difficulty, qtype, num_options=num_options
+                    )
                     if ai_questions:
-                        provider_used = 'Gemini'
+                        provider_used = label
                 except (ValueError, ImportError) as e:
-                    logger.info("AI generate: Gemini not used (%s)", e)
-                    pass
-
-            if not ai_questions:
-                try:
-                    from api.services.ai_generator import AIQuestionGenerator
-                    generator = AIQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
-                    if ai_questions:
-                        provider_used = 'OpenAI'
-                except (ValueError, ImportError) as e:
-                    logger.info("AI generate: OpenAI not used (%s)", e)
-                    pass
+                    logger.info("AI generate: %s not used (%s)", prov, e)
 
             # If AI generation succeeded and returned questions
             if ai_questions:
@@ -1909,13 +1969,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 )
                 print(
                     "[EasyTest AI] No API key configured or AI returned no questions. "
-                    "Using sample questions. For real AI: add GROQ_API_KEY or GEMINI_API_KEY to .env (see FREE_AI_SETUP.md)"
+                    "Using sample questions. For real AI: set QUESTION_AI_PROVIDERS and add GROQ_API_KEY, GEMINI_API_KEY, and/or OPENAI_API_KEY in .env (see FREE_AI_SETUP.md)"
                 )
                 mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
                 return Response(
                     {
                         'questions': mock_data,
-                        'warning': 'AI generation unavailable. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI (see FREE_AI_SETUP.md).'
+                        'warning': 'AI generation unavailable. Sample questions generated. Configure QUESTION_AI_PROVIDERS and GROQ_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY in .env (see FREE_AI_SETUP.md).'
                     },
                     status=status.HTTP_201_CREATED
                 )
@@ -1925,13 +1985,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
             logger.warning("AI generate: ValueError (e.g. missing API key): %s", e)
             print(
                 "[EasyTest AI] API key not set. Using sample questions. "
-                "Add GROQ_API_KEY or GEMINI_API_KEY to backend .env (see FREE_AI_SETUP.md)"
+                "Add OPENAI_API_KEY and/or GROQ_API_KEY / GEMINI_API_KEY to backend .env (see FREE_AI_SETUP.md). Use QUESTION_AI_PROVIDERS=openai to prefer GPT."
             )
             mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
             return Response(
                 {
                     'questions': mock_data,
-                    'warning': 'API key not configured. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI.'
+                    'warning': 'API key not configured. Sample questions generated. Add OPENAI_API_KEY (and QUESTION_AI_PROVIDERS=openai if desired) or GROQ / GEMINI keys in .env.'
                 },
                 status=status.HTTP_201_CREATED
             )
@@ -2152,13 +2212,15 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             if tid is not None:
                 base_qs = base_qs.filter(created_by_id=tid)
         if exam_id:
+            # Validate the exam is visible to the logged-in user.
+            # For participant listing, return the user's scoped participants
+            # rather than only exam-assigned participants.
             exam_qs = scope_exams_queryset(Exam.objects.all(), user)
             try:
-                exam = exam_qs.get(id=exam_id)
+                exam_qs.get(id=exam_id)
             except Exam.DoesNotExist:
                 return Participant.objects.none()
-            participant_ids = ExamParticipant.objects.filter(exam=exam).values_list('participant_id', flat=True)
-            return base_qs.filter(id__in=participant_ids).order_by(*base_order)
+            return base_qs.order_by(*base_order)
         return base_qs.order_by(*base_order)
 
     def perform_create(self, serializer):
@@ -2679,20 +2741,46 @@ def _participant_report_row(participant):
 
 
 def _seconds_per_attempt_from_answers(exam):
-    """Total time per attempt = sum(Answer.time_taken); same basis as leaderboard and report Speed columns."""
-    rows = (
-        Answer.objects.filter(attempt__exam=exam)
-        .values('attempt_id')
-        .annotate(total=Sum('time_taken'))
-    )
-    return {r['attempt_id']: max(0, int(r['total'] or 0)) for r in rows}
+    """
+    Total seconds per attempt = sum of Answer.time_taken for questions still on this exam.
+
+    Must match Excel/API "Speed" rows: those iterate exam_questions only. Answers tied to
+    question_ids no longer on the exam (removed/replaced after the live session) were inflating
+    leaderboard (e.g. 36s) vs summing visible Speed cells (e.g. 5+6+7+8).
+
+    We sum in Python from values_list instead of SQL Sum+GROUP BY so production MySQL/MariaDB
+    cannot return a wrong aggregate or a key type that breaks lookup.
+    """
+    qids = list(exam.exam_questions.values_list('question_id', flat=True))
+    if not qids:
+        return {}
+    rows = Answer.objects.filter(
+        attempt__exam=exam,
+        question_id__in=qids,
+    ).values_list('attempt_id', 'time_taken')
+    out = {}
+    for aid, tt in rows:
+        if aid is None:
+            continue
+        try:
+            k = int(aid)
+        except (TypeError, ValueError):
+            continue
+        try:
+            sec = max(0, int(tt)) if tt is not None else 0
+        except (TypeError, ValueError):
+            try:
+                sec = max(0, int(float(tt)))
+            except (TypeError, ValueError):
+                sec = 0
+        out[k] = out.get(k, 0) + sec
+    return out
 
 
 def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
-    """Prefer sum of answer times (leaderboard / exports); fallback to stored attempt field."""
-    if attempt.id in seconds_from_answers:
-        return seconds_from_answers[attempt.id]
-    return max(0, int(attempt.time_taken or 0))
+    """Total time = sum of Answer.time_taken for this attempt (current exam questions only — same as report Speed)."""
+    k = int(attempt.pk)
+    return max(0, int(seconds_from_answers.get(k, 0)))
 
 
 def _get_exam_report_data(exam):
