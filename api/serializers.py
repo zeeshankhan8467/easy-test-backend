@@ -88,7 +88,7 @@ class ExamQuestionSerializer(serializers.ModelSerializer):
         model = ExamQuestion
         fields = [
             'id', 'question', 'question_id', 'order', 'positive_marks',
-            'negative_marks', 'is_optional'
+            'negative_marks', 'is_optional', 'allow_revise'
         ]
         read_only_fields = ['id']
 
@@ -97,6 +97,7 @@ class ExamSerializer(serializers.ModelSerializer):
     question_count = serializers.SerializerMethodField()
     participant_count = serializers.SerializerMethodField()
     total_marks = serializers.SerializerMethodField()
+    last_attempt_at = serializers.SerializerMethodField()
     questions = ExamQuestionSerializer(source='exam_questions', many=True, read_only=True)
     can_edit = serializers.SerializerMethodField()
     school_id = serializers.SerializerMethodField()
@@ -112,7 +113,7 @@ class ExamSerializer(serializers.ModelSerializer):
             'question_change_automatic',
             'positive_marking', 'negative_marking', 'frozen', 'created_by',
             'created_at', 'updated_at', 'question_count', 'participant_count',
-            'total_marks', 'questions', 'can_edit', 'snapshot_data', 'snapshot_version',
+            'total_marks', 'last_attempt_at', 'questions', 'can_edit', 'snapshot_data', 'snapshot_version',
             'school_id', 'school_name', 'owner_id', 'owner_name',
         ]
         read_only_fields = [
@@ -132,6 +133,16 @@ class ExamSerializer(serializers.ModelSerializer):
 
     def get_total_marks(self, obj):
         return float(obj.total_marks)
+
+    def get_last_attempt_at(self, obj):
+        """Latest activity across all attempts: prefer last submitted_at, else last started_at (from queryset annotate)."""
+        sub = getattr(obj, 'last_attempt_submitted_at', None)
+        sta = getattr(obj, 'last_attempt_started_at', None)
+        if sub is not None:
+            return sub
+        if sta is not None:
+            return sta
+        return None
 
     def get_can_edit(self, obj):
         return obj.can_edit()
@@ -170,7 +181,11 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
         child=serializers.DictField(),
         write_only=True,
         required=False,
-        help_text="List of questions with marks: [{'question_id': 1, 'order': 0, 'positive_marks': 1.0, 'negative_marks': 0.0, 'is_optional': false}]"
+        help_text=(
+            "List of questions with marks: [{'question_id': 1, 'order': 0, "
+            "'positive_marks': 1.0, 'negative_marks': 0.0, "
+            "'is_optional': false, 'allow_revise': true}]"
+        )
     )
     owner_user_id = serializers.IntegerField(required=False, allow_null=True)
 
@@ -249,6 +264,16 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(f"Question {idx + 1}: Negative marks cannot be negative")
                 if order < 0:
                     raise serializers.ValidationError(f"Question {idx + 1}: Order cannot be negative")
+                rv = q.get('allow_revise', True)
+                if isinstance(rv, str):
+                    if rv.strip().lower() in ('false', '0', 'no'):
+                        rv = False
+                    elif rv.strip().lower() in ('true', '1', 'yes'):
+                        rv = True
+                if rv is not None and not isinstance(rv, bool):
+                    raise serializers.ValidationError(
+                        f"Question {idx + 1}: allow_revise must be a boolean"
+                    )
         
         return attrs
 
@@ -285,7 +310,8 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
                 order=q_data.get('order', 0),
                 positive_marks=q_data.get('positive_marks', 1.0),
                 negative_marks=q_data.get('negative_marks', 0.0),
-                is_optional=q_data.get('is_optional', False)
+                is_optional=q_data.get('is_optional', False),
+                allow_revise=q_data.get('allow_revise', True),
             )
         
         return exam
@@ -328,7 +354,8 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
                     order=q_data.get('order', idx),  # Use provided order or index
                     positive_marks=float(q_data.get('positive_marks', 1.0)),
                     negative_marks=float(q_data.get('negative_marks', 0.0)),
-                    is_optional=q_data.get('is_optional', False)
+                    is_optional=q_data.get('is_optional', False),
+                    allow_revise=q_data.get('allow_revise', True),
                 )
         
         return instance
@@ -342,7 +369,7 @@ class ParticipantSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'email', 'clicker_id', 'extra', 'created_at', 'owner_name']
         read_only_fields = ['id', 'created_at', 'owner_name']
         extra_kwargs = {
-            'name': {'required': True},
+            'name': {'required': False, 'allow_blank': True},
             'clicker_id': {'required': True},
             'email': {'required': False, 'allow_blank': True},
             'extra': {'required': False},
@@ -373,9 +400,24 @@ class ParticipantSerializer(serializers.ModelSerializer):
         return value
 
     def validate_name(self, value):
-        if not (value or '').strip():
-            raise serializers.ValidationError('Name is required.')
         return (value or '').strip()
+
+    def create(self, validated_data):
+        cid = (validated_data.get('clicker_id') or '').strip()
+        validated_data['clicker_id'] = cid
+        nm = (validated_data.get('name') or '').strip()
+        validated_data['name'] = nm if nm else cid
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'clicker_id' in validated_data:
+            validated_data['clicker_id'] = (validated_data.get('clicker_id') or '').strip()
+        cid = validated_data.get('clicker_id', instance.clicker_id)
+        cid = (cid or '').strip() or instance.clicker_id
+        if 'name' in validated_data:
+            nm = (validated_data.get('name') or '').strip()
+            validated_data['name'] = nm if nm else cid
+        return super().update(instance, validated_data)
 
     def validate_email(self, value):
         return (value or '').strip() or None
@@ -383,7 +425,10 @@ class ParticipantSerializer(serializers.ModelSerializer):
     def validate_extra(self, value):
         if not isinstance(value, dict):
             return {}
-        return {k: (v if v is None else str(v)) for k, v in value.items()}
+        out = {k: (v if v is None else str(v)) for k, v in value.items()}
+        if 'class' in out and out['class'] is not None and str(out['class']).strip() != '':
+            out['class'] = str(out['class']).strip()
+        return out
 
     def get_owner_name(self, obj):
         user = getattr(obj, 'created_by', None)
@@ -394,22 +439,17 @@ class ParticipantSerializer(serializers.ModelSerializer):
 
 
 class ParticipantBulkCreateSerializer(serializers.Serializer):
-    """Accepts a list of participants with name and clicker_id (email optional)."""
+    """Accepts a list of participants with clicker_id required; name optional (defaults to clicker_id)."""
     participants = serializers.ListField(
         child=serializers.DictField(),
         min_length=1,
-        help_text='List of {name, clicker_id, email?}'
+        help_text='List of {clicker_id, name?, email?}'
     )
 
     def validate_participants(self, value):
         seen = set()
         for i, item in enumerate(value):
-            name = (item.get('name') or '').strip()
             clicker_id = (item.get('clicker_id') or '').strip()
-            if not name:
-                raise serializers.ValidationError(
-                    {'participants': f'Row {i + 1}: Name is required.'}
-                )
             if not clicker_id:
                 raise serializers.ValidationError(
                     {'participants': f'Row {i + 1}: Clicker ID is required.'}

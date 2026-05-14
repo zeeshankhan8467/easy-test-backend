@@ -1,6 +1,7 @@
 """
 Seed dummy data for all EasyTest features: users, participants, questions, exams,
-exam-question/participant links, attempts, and answers.
+exam-question/participant links, attempts, answers, daily attendance (Attendance page),
+and report/leaderboard data.
 Only multiple choice (mcq) questions are created.
 Run: python manage.py seed_dummy_data
 Use --clear to remove existing dummy exams first (optional).
@@ -9,6 +10,7 @@ Use --skip-existing to skip if dummy data already exists.
 import hashlib
 import json as json_lib
 from decimal import Decimal
+from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.contrib.auth.models import User
@@ -16,6 +18,7 @@ from django.contrib.auth.models import User
 from api.models import (
     Exam, Question, ExamQuestion, Participant,
     ExamParticipant, ExamAttempt, Answer, School, UserProfile,
+    DailyAttendance,
     ROLE_SUPER_ADMIN, ROLE_SCHOOL_ADMIN, ROLE_TEACHER,
 )
 
@@ -198,27 +201,48 @@ def create_participants(stdout, school=None, created_by=None):
     return list(Participant.objects.filter(clicker_id__in=[x["clicker_id"] for x in PARTICIPANTS_DATA]))
 
 
-def create_questions(stdout):
+def create_questions(stdout, created_by=None):
+    """Create seed questions owned by teacher so they appear under /questions and in exams."""
     created = []
     question_texts = [x[0] for x in QUESTIONS_BANK]
     for row in QUESTIONS_BANK:
         text, qtype, options, correct_answer, difficulty, option_display = row
-        q, is_new = Question.objects.get_or_create(
-            text=text,
-            defaults={
-                "type": qtype,
-                "options": options,
-                "correct_answer": correct_answer,
-                "difficulty": difficulty,
-                "option_display": option_display,
-                "tags": ["seed", qtype, difficulty],
-                "marks": Decimal("1.0"),
-            }
-        )
+        lookup = Question.objects.filter(text=text)
+        if created_by is not None:
+            lookup = lookup.filter(created_by=created_by)
+        q = lookup.first()
+        if q:
+            changed = []
+            if created_by is not None and q.created_by_id != created_by.id:
+                q.created_by = created_by
+                changed.append("created_by")
+            if q.option_display != option_display:
+                q.option_display = option_display
+                changed.append("option_display")
+            if changed:
+                q.save(update_fields=changed)
+            is_new = False
+        else:
+            q = Question.objects.create(
+                text=text,
+                type=qtype,
+                options=options,
+                correct_answer=correct_answer,
+                difficulty=difficulty,
+                option_display=option_display,
+                tags=["seed", qtype, difficulty],
+                marks=Decimal("1.0"),
+                created_by=created_by,
+            )
+            is_new = True
         if is_new:
             created.append(q)
-    stdout.write(f"  Questions: {len(created)} new, {len(QUESTIONS_BANK)} in bank.")
-    return list(Question.objects.filter(text__in=question_texts))
+    stdout.write(f"  Questions: {len(created)} new, {len(QUESTIONS_BANK)} in bank for teacher.")
+
+    fetched = Question.objects.filter(text__in=question_texts)
+    if created_by is not None:
+        fetched = fetched.filter(created_by=created_by)
+    return list(fetched.order_by("id"))
 
 
 def freeze_exam_with_snapshot(exam, exam_questions):
@@ -246,6 +270,7 @@ def freeze_exam_with_snapshot(exam, exam_questions):
             "positive_marks": float(eq.positive_marks),
             "negative_marks": float(eq.negative_marks),
             "is_optional": eq.is_optional,
+            "allow_revise": bool(getattr(eq, "allow_revise", True)),
         })
     snapshot_json = json_lib.dumps(snapshot_data, sort_keys=True)
     exam.status = "frozen"
@@ -325,6 +350,32 @@ def create_attempts_and_answers(exam, participants, exam_questions, stdout):
     stdout.write(f"  Attempts: {ExamAttempt.objects.filter(exam=exam).count()} for exam '{exam.title}'.")
 
 
+def seed_daily_attendance(stdout, participants, recorded_by=None, days=14):
+    """Attendance page: one row per participant per calendar day (last `days` days)."""
+    if not participants:
+        stdout.write("  DailyAttendance: skipped (no participants).")
+        return
+    today = timezone.localdate()
+    count = 0
+    for day_offset in range(days):
+        day = today - timedelta(days=day_offset)
+        for idx, p in enumerate(participants):
+            # Patterns: weekday-ish mix; predictable for demos
+            present = (idx + day_offset + day.weekday()) % 4 != 0
+            DailyAttendance.objects.update_or_create(
+                participant=p,
+                date=day,
+                defaults={
+                    "present": present,
+                    "recorded_by": recorded_by,
+                },
+            )
+            count += 1
+    stdout.write(
+        f"  DailyAttendance: {count} rows ({days} days × {len(participants)} students); Attendance UI will show summary."
+    )
+
+
 class Command(BaseCommand):
     help = "Seed dummy data for all features: participants, questions, exams, attempts, reports, leaderboard."
 
@@ -349,10 +400,17 @@ class Command(BaseCommand):
             default=TEACHER_PASSWORD,
             help="Teacher password to set/update for the teacher user (default: EasyTest@123).",
         )
+        parser.add_argument(
+            "--attendance-days",
+            type=int,
+            default=14,
+            help="Days of DailyAttendance seed data (default: 14).",
+        )
 
     def handle(self, *args, **options):
         teacher_email = (options.get("teacher_email") or TEACHER_EMAIL).strip().lower()
         teacher_password = options.get("teacher_password") or TEACHER_PASSWORD
+        attendance_days = max(1, min(90, int(options.get("attendance_days") or 14)))
 
         dummy_titles = [c[0] for c in EXAMS_CONFIG]
         # Ensure RBAC users exist (including the requested teacher) before we clear/seed exams.
@@ -373,8 +431,11 @@ class Command(BaseCommand):
         # 1. Participants (link to demo school so School Admin/Teacher can see them)
         participants = create_participants(self.stdout, demo_school, created_by=user)
 
-        # 2. Question bank
-        questions = create_questions(self.stdout)
+        # 1b. Daily attendance (standalone calendar rows for Attendance report page)
+        seed_daily_attendance(self.stdout, participants, recorded_by=user, days=attendance_days)
+
+        # 2. Question bank (owned by teacher so Question Bank lists them)
+        questions = create_questions(self.stdout, created_by=user)
         question_pool = questions[: len(QUESTIONS_BANK)]
 
         # 3. Exams: create each and link questions + participants
@@ -417,6 +478,7 @@ class Command(BaseCommand):
                         "order": order,
                         "positive_marks": Decimal("1.0"),
                         "negative_marks": Decimal("0.25"),
+                        "allow_revise": True,
                     }
                 )
 
@@ -426,7 +488,12 @@ class Command(BaseCommand):
                     ExamQuestion.objects.get_or_create(
                         exam=exam,
                         question=q,
-                        defaults={"order": order, "positive_marks": Decimal("1.0"), "negative_marks": Decimal("0.25")}
+                        defaults={
+                            "order": order,
+                            "positive_marks": Decimal("1.0"),
+                            "negative_marks": Decimal("0.25"),
+                            "allow_revise": True,
+                        }
                     )
                 exam_questions = list(exam.exam_questions.select_related("question").order_by("order"))
 
@@ -448,6 +515,7 @@ class Command(BaseCommand):
                 create_attempts_and_answers(exam, attempt_participants, exam_questions, self.stdout)
 
         self.stdout.write(self.style.SUCCESS(
-            "Done. Simple seed data created. Verify: Participants (Student 1–5, clicker_id 1–5, roll_no 1–5), "
-            "Questions (option_display alpha/numeric), Exams (Simple Draft/Frozen/Completed), Reports and Leaderboard."
+            f"Done. Seed data includes: Participants, DailyAttendance ({attendance_days} days), "
+            f"Questions (owned by teacher), Exams (Draft/Frozen/Completed with attempts where applicable), "
+            f"Reports & Leaderboard. Log in as teacher: {teacher_email}"
         ))

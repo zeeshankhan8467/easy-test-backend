@@ -153,6 +153,10 @@ class ExamQuestion(models.Model):
     positive_marks = models.DecimalField(max_digits=5, decimal_places=2, default=1.0, help_text="Marks for correct answer")
     negative_marks = models.DecimalField(max_digits=5, decimal_places=2, default=0.0, help_text="Marks deducted for wrong answer")
     is_optional = models.BooleanField(default=False, help_text="Whether this question is optional")
+    allow_revise = models.BooleanField(
+        default=True,
+        help_text="Allow participants to change their answer after first submit on this question (requires exam revisable)",
+    )
 
     class Meta:
         unique_together = ['exam', 'question']
