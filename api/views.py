@@ -326,6 +326,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         return qs.annotate(
             last_attempt_submitted_at=Max('attempts__submitted_at'),
             last_attempt_started_at=Max('attempts__started_at'),
+            attempt_count=Count('attempts', distinct=True),
         )
 
     def get_serializer_class(self):

@@ -99,6 +99,7 @@ class ExamSerializer(serializers.ModelSerializer):
     participant_count = serializers.SerializerMethodField()
     total_marks = serializers.SerializerMethodField()
     last_attempt_at = serializers.SerializerMethodField()
+    attempt_count = serializers.SerializerMethodField()
     questions = ExamQuestionSerializer(source='exam_questions', many=True, read_only=True)
     can_edit = serializers.SerializerMethodField()
     school_id = serializers.SerializerMethodField()
@@ -114,7 +115,8 @@ class ExamSerializer(serializers.ModelSerializer):
             'question_change_automatic',
             'positive_marking', 'negative_marking', 'frozen', 'created_by',
             'created_at', 'updated_at', 'question_count', 'participant_count',
-            'total_marks', 'last_attempt_at', 'questions', 'can_edit', 'snapshot_data', 'snapshot_version',
+            'attempt_count', 'total_marks', 'last_attempt_at', 'questions', 'can_edit',
+            'snapshot_data', 'snapshot_version',
             'school_id', 'school_name', 'owner_id', 'owner_name',
         ]
         read_only_fields = [
@@ -144,6 +146,16 @@ class ExamSerializer(serializers.ModelSerializer):
         if sta is not None:
             return sta
         return None
+
+    def get_attempt_count(self, obj):
+        """Number of participant attempts on this exam. Uses queryset annotation when available, else live count."""
+        n = getattr(obj, 'attempt_count', None)
+        if isinstance(n, int):
+            return n
+        try:
+            return obj.attempts.count()
+        except Exception:
+            return 0
 
     def get_can_edit(self, obj):
         return obj.can_edit()
