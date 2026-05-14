@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
+from django.db.models import Q
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
     Exam, Question, ExamQuestion, Participant,
@@ -379,28 +380,64 @@ class ParticipantSerializer(serializers.ModelSerializer):
         value = (value or '').strip()
         if not value:
             raise serializers.ValidationError('Clicker ID is required.')
-        # Uniqueness is per teacher (created_by), not global — matches scoped participant list API.
+        return value
+
+    def validate_name(self, value):
+        return (value or '').strip()
+
+    def validate(self, attrs):
+        """Enforce per-(teacher, class, section) uniqueness for clicker_id.
+
+        The same keypad ID may exist for a teacher across different sections
+        (and / or classes) — e.g. clicker `1` in `10-A` and `10-B`. So we only
+        reject when another participant with the same `created_by`, `extra.class`,
+        and `extra.section` already uses the same `clicker_id`.
+        """
+        clicker_id = (attrs.get('clicker_id') if 'clicker_id' in attrs else getattr(self.instance, 'clicker_id', '')) or ''
+        clicker_id = str(clicker_id).strip()
+        if not clicker_id:
+            return attrs
+
+        if 'extra' in attrs:
+            extra = attrs.get('extra') or {}
+        else:
+            extra = (getattr(self.instance, 'extra', None) or {}) if self.instance else {}
+        cls = str(extra.get('class', '') or '').strip()
+        section = str(extra.get('section', '') or '').strip()
+
         request = self.context.get('request')
         user = getattr(request, 'user', None) if request else None
         if self.instance is not None:
             owner_id = self.instance.created_by_id
         else:
             owner_id = user.id if user and getattr(user, 'is_authenticated', False) else None
-        qs = Participant.objects.filter(clicker_id=value)
+
+        qs = Participant.objects.filter(clicker_id=clicker_id)
         if owner_id is not None:
             qs = qs.filter(created_by_id=owner_id)
         else:
             qs = qs.filter(created_by__isnull=True)
+        if cls:
+            qs = qs.filter(extra__class=cls)
+        else:
+            qs = qs.filter(Q(extra__class__isnull=True) | Q(extra__class=''))
+        if section:
+            qs = qs.filter(extra__section=section)
+        else:
+            qs = qs.filter(Q(extra__section__isnull=True) | Q(extra__section=''))
         if self.instance:
             qs = qs.exclude(pk=self.instance.pk)
         if qs.exists():
+            scope_bits = []
+            if cls:
+                scope_bits.append(f'class "{cls}"')
+            if section:
+                scope_bits.append(f'section "{section}"')
+            scope_label = ' and '.join(scope_bits) if scope_bits else 'no class/section'
             raise serializers.ValidationError(
-                'This clicker ID is already used by another participant in your roster.'
+                {'clicker_id': f'Clicker ID "{clicker_id}" is already used in {scope_label}. Pick a different keypad ID or change the class/section.'}
             )
-        return value
-
-    def validate_name(self, value):
-        return (value or '').strip()
+        return attrs
 
     def create(self, validated_data):
         cid = (validated_data.get('clicker_id') or '').strip()
@@ -426,8 +463,9 @@ class ParticipantSerializer(serializers.ModelSerializer):
         if not isinstance(value, dict):
             return {}
         out = {k: (v if v is None else str(v)) for k, v in value.items()}
-        if 'class' in out and out['class'] is not None and str(out['class']).strip() != '':
-            out['class'] = str(out['class']).strip()
+        for k in ('class', 'section', 'team'):
+            if k in out and out[k] is not None and str(out[k]).strip() != '':
+                out[k] = str(out[k]).strip()
         return out
 
     def get_owner_name(self, obj):
@@ -454,11 +492,16 @@ class ParticipantBulkCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError(
                     {'participants': f'Row {i + 1}: Clicker ID is required.'}
                 )
-            if clicker_id in seen:
+            cls = str(item.get('class', '') or '').strip()
+            section = str(item.get('section', '') or '').strip()
+            key = (cls, section, clicker_id)
+            if key in seen:
+                scope_bits = [f'class "{cls}"' if cls else '', f'section "{section}"' if section else '']
+                scope_label = ' and '.join(b for b in scope_bits if b) or 'no class/section'
                 raise serializers.ValidationError(
-                    {'participants': f'Row {i + 1}: Duplicate clicker_id "{clicker_id}".'}
+                    {'participants': f'Row {i + 1}: Duplicate clicker_id "{clicker_id}" in {scope_label}.'}
                 )
-            seen.add(clicker_id)
+            seen.add(key)
         return value
 
 
@@ -508,6 +551,8 @@ class QuestionAnalysisSerializer(serializers.Serializer):
     option_display = serializers.CharField(required=False, default='alpha')
     correct_answer = serializers.ListField(required=False, allow_null=True)
     option_votes = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
+    answered_count = serializers.IntegerField(required=False)
+    no_response_count = serializers.IntegerField(required=False)
 
 
 class ParticipantQuestionAnswerSerializer(serializers.Serializer):
@@ -557,6 +602,8 @@ class ExamReportSerializer(serializers.Serializer):
     lowest_score = serializers.FloatField()
     question_analysis = QuestionAnalysisSerializer(many=True)
     participant_results = ParticipantResultSerializer(many=True)
+    question_analysis_scope = serializers.CharField(required=False)
+    assigned_participant_count = serializers.IntegerField(required=False)
 
 
 class DashboardStatsSerializer(serializers.Serializer):

@@ -2293,17 +2293,18 @@ class ParticipantViewSet(viewsets.ModelViewSet):
         class_param = (self.request.query_params.get('class') or '').strip()
         if class_param:
             base_qs = base_qs.filter(extra__class=class_param)
+        section_param = (self.request.query_params.get('section') or '').strip()
+        if section_param:
+            base_qs = base_qs.filter(extra__section=section_param)
+        team_param = (self.request.query_params.get('team') or '').strip()
+        if team_param:
+            base_qs = base_qs.filter(extra__team=team_param)
         return base_qs.order_by(*base_order)
 
-    @action(detail=False, methods=['get'], url_path='distinct_classes')
-    def distinct_classes(self, request):
-        """Distinct non-empty `extra.class` values for the current roster scope (same filters as list except `class`)."""
-        qs = self.get_queryset()
-        rows = (
-            qs.exclude(extra__class__isnull=True)
-            .exclude(extra__class='')
-            .values_list('extra__class', flat=True)
-        )
+    def _distinct_extra_field(self, queryset, field_key):
+        """Distinct non-empty string values for extra[field_key]."""
+        key_path = f'extra__{field_key}'
+        rows = queryset.exclude(**{f'{key_path}__isnull': True}).exclude(**{key_path: ''}).values_list(key_path, flat=True)
         seen = set()
         out = []
         for v in rows:
@@ -2315,7 +2316,25 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             seen.add(s)
             out.append(s)
         out.sort(key=lambda x: (x.lower(), x))
-        return Response({'classes': out})
+        return out
+
+    @action(detail=False, methods=['get'], url_path='distinct_classes')
+    def distinct_classes(self, request):
+        """Distinct non-empty `extra.class` for the current roster scope (do not pass `class`/`section`/`team` when populating this dropdown)."""
+        qs = self.get_queryset()
+        return Response({'classes': self._distinct_extra_field(qs, 'class')})
+
+    @action(detail=False, methods=['get'], url_path='distinct_sections')
+    def distinct_sections(self, request):
+        """Distinct `extra.section` for scope. Request may include `class` to narrow; do not pass `section`/`team` when populating this dropdown."""
+        qs = self.get_queryset()
+        return Response({'sections': self._distinct_extra_field(qs, 'section')})
+
+    @action(detail=False, methods=['get'], url_path='distinct_teams')
+    def distinct_teams(self, request):
+        """Distinct `extra.team` for scope. Request may include `class`, `section`; do not pass `team` when populating this dropdown."""
+        qs = self.get_queryset()
+        return Response({'teams': self._distinct_extra_field(qs, 'team')})
 
     @action(detail=False, methods=['post'], url_path='delete_all')
     def delete_all(self, request):
@@ -2339,7 +2358,11 @@ class ParticipantViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
-        """Create multiple participants in one request. Each item needs clicker_id; name optional (defaults to clicker_id); email optional."""
+        """Create multiple participants in one request. Each item needs clicker_id; name optional (defaults to clicker_id); email optional.
+
+        Uniqueness for `clicker_id` is scoped to (created_by, extra.class, extra.section) so the
+        same keypad ID can exist in different sections (even within the same class).
+        """
         from .serializers import ParticipantBulkCreateSerializer
         ser = ParticipantBulkCreateSerializer(data=request.data)
         if not ser.is_valid():
@@ -2355,6 +2378,34 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                      if k not in RESERVED_KEYS and v is not None and str(v).strip() != ''}
             if 'class' in extra:
                 extra['class'] = str(extra['class']).strip()
+            if 'section' in extra:
+                extra['section'] = str(extra['section']).strip()
+            if 'team' in extra:
+                extra['team'] = str(extra['team']).strip()
+            cls = extra.get('class', '')
+            section = extra.get('section', '')
+            dup_qs = Participant.objects.filter(
+                created_by=request.user, clicker_id=clicker_id,
+            )
+            if cls:
+                dup_qs = dup_qs.filter(extra__class=cls)
+            else:
+                dup_qs = dup_qs.filter(Q(extra__class__isnull=True) | Q(extra__class=''))
+            if section:
+                dup_qs = dup_qs.filter(extra__section=section)
+            else:
+                dup_qs = dup_qs.filter(Q(extra__section__isnull=True) | Q(extra__section=''))
+            if dup_qs.exists():
+                scope_bits = []
+                if cls:
+                    scope_bits.append(f'class "{cls}"')
+                if section:
+                    scope_bits.append(f'section "{section}"')
+                scope_label = ' and '.join(scope_bits) if scope_bits else 'no class/section'
+                errors.append(
+                    f'Row {i + 1}: Clicker ID "{clicker_id}" already exists in {scope_label}.'
+                )
+                continue
             try:
                 school_id = get_user_school_id(request.user)
                 participant = Participant.objects.create(
@@ -2378,6 +2429,8 @@ class ParticipantViewSet(viewsets.ModelViewSet):
         file = request.FILES.get('file')
         exam_id = request.data.get('exam_id')
         default_class = (request.data.get('default_class') or '').strip() or None
+        default_section = (request.data.get('default_section') or '').strip() or None
+        default_team = (request.data.get('default_team') or '').strip() or None
 
         if not file:
             return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
@@ -2488,6 +2541,14 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                         extra['class'] = default_class
                     elif extra.get('class') is not None:
                         extra['class'] = str(extra['class']).strip()
+                    if default_section and (not extra.get('section') or not str(extra.get('section', '')).strip()):
+                        extra['section'] = default_section
+                    elif extra.get('section') is not None:
+                        extra['section'] = str(extra['section']).strip()
+                    if default_team and (not extra.get('team') or not str(extra.get('team', '')).strip()):
+                        extra['team'] = default_team
+                    elif extra.get('team') is not None:
+                        extra['team'] = str(extra['team']).strip()
                     
                     # Avoid UNIQUE constraint on email: if this email is already used by another
                     # participant (different clicker_id), keep it only in extra and set model email to None.
@@ -2498,11 +2559,38 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                             email = None
                     
                     school_id = get_user_school_id(request.user)
-                    participant, created = Participant.objects.update_or_create(
-                        clicker_id=clicker_id,
-                        created_by=request.user,
-                        defaults={'name': name, 'email': email, 'school_id': school_id, 'extra': extra},
+                    # Uniqueness for clicker_id is scoped to (created_by, extra.class, extra.section)
+                    # so an import row only updates an existing participant when class & section also match.
+                    cls_val = str(extra.get('class', '') or '').strip()
+                    section_val = str(extra.get('section', '') or '').strip()
+                    match_qs = Participant.objects.filter(
+                        created_by=request.user, clicker_id=clicker_id,
                     )
+                    if cls_val:
+                        match_qs = match_qs.filter(extra__class=cls_val)
+                    else:
+                        match_qs = match_qs.filter(Q(extra__class__isnull=True) | Q(extra__class=''))
+                    if section_val:
+                        match_qs = match_qs.filter(extra__section=section_val)
+                    else:
+                        match_qs = match_qs.filter(Q(extra__section__isnull=True) | Q(extra__section=''))
+                    existing = match_qs.first()
+                    if existing is not None:
+                        existing.name = name
+                        existing.email = email
+                        existing.school_id = school_id
+                        existing.extra = extra
+                        existing.save(update_fields=['name', 'email', 'school_id', 'extra'])
+                        participant = existing
+                    else:
+                        participant = Participant.objects.create(
+                            name=name,
+                            clicker_id=clicker_id,
+                            email=email,
+                            school_id=school_id,
+                            extra=extra,
+                            created_by=request.user,
+                        )
                     
                     if exam_id:
                         try:
@@ -2910,8 +2998,18 @@ def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
     return max(0, int(seconds_from_answers.get(k, 0)))
 
 
-def _get_exam_report_data(exam):
-    """Build report data dict for an exam (no request needed). Used by exam_report and export."""
+def _get_exam_report_data(exam, question_scope='voted'):
+    """Build report data dict for an exam (no request needed). Used by exam_report and export.
+
+    question_scope:
+      - 'voted': question stats use only participants who submitted an answer per question (current behavior).
+      - 'all': denominators use assigned roster (ExamParticipant); accuracy = correct / assigned;
+               option percentages use assigned count; unanswered counted as no_response_count.
+    """
+    question_scope = (question_scope or 'voted').strip().lower()
+    if question_scope not in ('voted', 'all'):
+        question_scope = 'voted'
+
     attempts = ExamAttempt.objects.filter(exam=exam)
     total_participants = attempts.count()
     if total_participants == 0:
@@ -2923,19 +3021,24 @@ def _get_exam_report_data(exam):
             'highest_score': 0,
             'lowest_score': 0,
             'question_analysis': [],
-            'participant_results': []
+            'participant_results': [],
+            'question_analysis_scope': question_scope,
+            'assigned_participant_count': ExamParticipant.objects.filter(exam=exam).count(),
         }
     avg_score = attempts.aggregate(avg=Avg('score'))['avg'] or 0
     highest = attempts.aggregate(max=Max('score'))['max'] or 0
     lowest = attempts.aggregate(min=Min('score'))['min'] or 0
     questions_ordered = list(exam.exam_questions.select_related('question').order_by('order'))
+    assigned_for_questions = ExamParticipant.objects.filter(exam=exam).count()
+    if assigned_for_questions == 0:
+        assigned_for_questions = attempts.values('participant_id').distinct().count()
+
     question_analysis = []
     for eq in questions_ordered:
         question = eq.question
         answers = Answer.objects.filter(attempt__exam=exam, question=question)
-        total_attempts = answers.count()
+        answered_count = answers.count()
         correct_attempts = answers.filter(is_correct=True).count()
-        accuracy = (correct_attempts / total_attempts * 100) if total_attempts > 0 else 0
         avg_time = answers.aggregate(avg=Avg('time_taken'))['avg'] or 0
         # Per-option vote counts (0-based index -> count)
         options = question.options or []
@@ -2950,7 +3053,19 @@ def _get_exam_report_data(exam):
                         option_votes[idx] += 1
             elif isinstance(sel, int) and 0 <= sel < len(option_votes):
                 option_votes[sel] += 1
-        question_analysis.append({
+
+        if question_scope == 'all':
+            denom = assigned_for_questions
+            total_attempts = denom
+            accuracy = (correct_attempts / denom * 100) if denom > 0 else 0
+            no_response_count = max(0, denom - answered_count)
+        else:
+            denom = answered_count
+            total_attempts = answered_count
+            accuracy = (correct_attempts / denom * 100) if denom > 0 else 0
+            no_response_count = 0
+
+        row = {
             'question_id': question.id,
             'question_text': question.text,
             'total_attempts': total_attempts,
@@ -2961,7 +3076,10 @@ def _get_exam_report_data(exam):
             'option_display': getattr(question, 'option_display', 'alpha'),
             'correct_answer': _normalize_correct_answer(question.correct_answer),
             'option_votes': option_votes,
-        })
+            'answered_count': answered_count,
+            'no_response_count': no_response_count,
+        }
+        question_analysis.append(row)
     seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempts_sorted = list(attempts.select_related('participant'))
     attempts_sorted.sort(
@@ -3031,6 +3149,8 @@ def _get_exam_report_data(exam):
         'question_analysis': question_analysis,
         'participant_results': participant_results,
         'participant_detail_columns': _participant_detail_columns_with_data(participant_results),
+        'question_analysis_scope': question_scope,
+        'assigned_participant_count': assigned_for_questions,
     }
     return report_data
 
@@ -3043,7 +3163,10 @@ def exam_report(request, exam_id):
         exam = qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
-    report_data = _get_exam_report_data(exam)
+    report_data = _get_exam_report_data(
+        exam,
+        question_scope=(request.query_params.get('question_scope') or 'voted'),
+    )
     serializer = ExamReportSerializer(report_data)
     return Response(serializer.data)
 
@@ -3874,7 +3997,11 @@ def dashboard(request):
 
 
 def _build_student_performance_rows(user, query_params):
-    """Build role-scoped student performance rows from query params."""
+    """Build role-scoped student performance rows: one row per participant per exam (submitted attempt).
+
+    Optional query params: admission_no, roll_no, student_name, class_name, section, teacher_name, subject,
+    exam_name (substring match on exam title), exam_id (exact), from_date, to_date.
+    """
     # Role-wise scoping
     participants_qs = scope_participants_queryset(Participant.objects.all(), user)
     exams_qs = scope_exams_queryset(Exam.objects.all(), user)
@@ -3886,6 +4013,8 @@ def _build_student_performance_rows(user, query_params):
     section = (query_params.get('section') or '').strip().lower()
     teacher_name = (query_params.get('teacher_name') or '').strip().lower()
     subject = (query_params.get('subject') or '').strip().lower()
+    exam_name = (query_params.get('exam_name') or '').strip()
+    exam_id_raw = (query_params.get('exam_id') or '').strip()
     from_date = (query_params.get('from_date') or '').strip()
     to_date = (query_params.get('to_date') or '').strip()
 
@@ -3894,43 +4023,46 @@ def _build_student_performance_rows(user, query_params):
         participant__in=participants_qs,
     ).select_related('participant', 'exam')
 
+    if exam_id_raw:
+        try:
+            attempts_qs = attempts_qs.filter(exam_id=int(exam_id_raw))
+        except (TypeError, ValueError):
+            pass
+    if exam_name:
+        attempts_qs = attempts_qs.filter(exam__title__icontains=exam_name)
+
     if from_date:
         attempts_qs = attempts_qs.filter(submitted_at__date__gte=from_date)
     if to_date:
         attempts_qs = attempts_qs.filter(submitted_at__date__lte=to_date)
 
-    rows_by_participant = {}
-    for attempt in attempts_qs:
+    rows = []
+    for attempt in attempts_qs.order_by('exam__title', 'participant__name'):
         p = attempt.participant
         if not p:
             continue
         extra = p.extra or {}
         name_val = (p.name or '').strip()
-        row = rows_by_participant.get(p.id)
-        if row is None:
-            row = {
-                'participant_id': p.id,
-                'admission_no': (extra.get('admission_no') or '').strip() if isinstance(extra, dict) else '',
-                'roll_no': (extra.get('roll_no') or '').strip() if isinstance(extra, dict) else '',
-                'student_name': name_val,
-                'class_name': (extra.get('class') or '').strip() if isinstance(extra, dict) else '',
-                'section': (extra.get('section') or '').strip() if isinstance(extra, dict) else '',
-                'teacher_name': (extra.get('teacher_name') or '').strip() if isinstance(extra, dict) else '',
-                'subject': (extra.get('subject') or '').strip() if isinstance(extra, dict) else '',
-                '_attempts': 0,
-                '_pct_sum': 0.0,
-            }
-            rows_by_participant[p.id] = row
-
+        row = {
+            'participant_id': p.id,
+            'exam_id': attempt.exam_id,
+            'exam_name': (attempt.exam.title or '').strip(),
+            'exam_created_at': attempt.exam.created_at.isoformat() if attempt.exam.created_at else None,
+            'exam_updated_at': attempt.exam.updated_at.isoformat() if attempt.exam.updated_at else None,
+            'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+            'admission_no': (extra.get('admission_no') or '').strip() if isinstance(extra, dict) else '',
+            'roll_no': (extra.get('roll_no') or '').strip() if isinstance(extra, dict) else '',
+            'student_name': name_val,
+            'class_name': (extra.get('class') or '').strip() if isinstance(extra, dict) else '',
+            'section': (extra.get('section') or '').strip() if isinstance(extra, dict) else '',
+            'teacher_name': (extra.get('teacher_name') or '').strip() if isinstance(extra, dict) else '',
+            'subject': (extra.get('subject') or '').strip() if isinstance(extra, dict) else '',
+        }
         pct = 0.0
         if attempt.total_questions and float(getattr(attempt.exam, 'positive_marking', 1) or 1) > 0:
             pct = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
-        row['_attempts'] += 1
-        row['_pct_sum'] += pct
+        row['total_percentage'] = round(pct, 2)
 
-    rows = []
-    for row in rows_by_participant.values():
-        # Apply text filters on flattened row values
         if admission_no and admission_no not in (row['admission_no'] or '').lower():
             continue
         if roll_no and roll_no not in (row['roll_no'] or '').lower():
@@ -3946,12 +4078,15 @@ def _build_student_performance_rows(user, query_params):
         if subject and subject not in (row['subject'] or '').lower():
             continue
 
-        attempts_count = row.pop('_attempts', 0) or 0
-        pct_sum = row.pop('_pct_sum', 0.0) or 0.0
-        row['total_percentage'] = round((pct_sum / attempts_count), 2) if attempts_count > 0 else 0.0
         rows.append(row)
 
-    rows.sort(key=lambda x: (-float(x.get('total_percentage') or 0), (x.get('student_name') or '').lower()))
+    rows.sort(
+        key=lambda x: (
+            (x.get('exam_name') or '').lower(),
+            (x.get('student_name') or '').lower(),
+            -float(x.get('total_percentage') or 0),
+        )
+    )
     return rows
 
 
@@ -3960,8 +4095,9 @@ def _build_student_performance_rows(user, query_params):
 def student_performance_report(request):
     """
     GET /api/reports/student-performance/
-    Role-scoped student performance rows with optional filters:
+    Role-scoped rows: one per participant per exam (submitted attempt). Optional filters:
       admission_no, roll_no, student_name, class_name, section, teacher_name, subject,
+      exam_name (substring on exam title), exam_id (exact),
       from_date (YYYY-MM-DD), to_date (YYYY-MM-DD)
     """
     rows = _build_student_performance_rows(request.user, request.query_params)
@@ -3981,11 +4117,17 @@ def student_performance_report_export(request):
     format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
 
     columns = [
+        'exam_id', 'exam_name', 'exam_created_at', 'exam_updated_at', 'submitted_at',
         'admission_no', 'roll_no', 'student_name', 'class_name',
         'section', 'teacher_name', 'subject', 'total_percentage'
     ]
     df = pd.DataFrame(rows, columns=columns)
     df = df.rename(columns={
+        'exam_id': 'Exam ID',
+        'exam_name': 'Exam Name',
+        'exam_created_at': 'Exam created',
+        'exam_updated_at': 'Exam last updated',
+        'submitted_at': 'Submitted at',
         'admission_no': 'Admission No',
         'roll_no': 'Roll No',
         'student_name': 'Student Name',
@@ -3993,7 +4135,7 @@ def student_performance_report_export(request):
         'section': 'Section',
         'teacher_name': 'Teacher Name',
         'subject': 'Subject',
-        'total_percentage': 'Total Percentage %',
+        'total_percentage': 'Percentage %',
     })
 
     output = BytesIO()

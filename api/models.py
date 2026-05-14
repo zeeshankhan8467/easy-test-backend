@@ -172,7 +172,10 @@ class ExamQuestion(models.Model):
 class Participant(models.Model):
     name = models.CharField(max_length=200)
     email = models.EmailField(blank=True, null=True, unique=True)  # optional
-    # Unique per owner (teacher), not globally — different teachers may use the same keypad IDs.
+    # Uniqueness for clicker_id is enforced in serializers/views scoped to
+    # (created_by, extra.class, extra.section). The same keypad ID may exist
+    # for the same teacher across different sections (e.g. 10-A vs 10-B), so
+    # there is no DB-level UniqueConstraint on clicker_id alone.
     clicker_id = models.CharField(max_length=50)
     school = models.ForeignKey(
         School, on_delete=models.CASCADE, null=True, blank=True,
@@ -184,12 +187,6 @@ class Participant(models.Model):
 
     class Meta:
         ordering = ['clicker_id']
-        constraints = [
-            models.UniqueConstraint(
-                fields=['created_by', 'clicker_id'],
-                name='uniq_participant_created_by_clicker_id',
-            ),
-        ]
 
     def __str__(self):
         return self.name
