@@ -97,6 +97,7 @@ class ExamQuestionSerializer(serializers.ModelSerializer):
 class ExamSerializer(serializers.ModelSerializer):
     question_count = serializers.SerializerMethodField()
     participant_count = serializers.SerializerMethodField()
+    participant_ids = serializers.SerializerMethodField()
     total_marks = serializers.SerializerMethodField()
     last_attempt_at = serializers.SerializerMethodField()
     attempt_count = serializers.SerializerMethodField()
@@ -115,6 +116,7 @@ class ExamSerializer(serializers.ModelSerializer):
             'question_change_automatic',
             'positive_marking', 'negative_marking', 'frozen', 'created_by',
             'created_at', 'updated_at', 'question_count', 'participant_count',
+            'participant_ids',
             'attempt_count', 'total_marks', 'last_attempt_at', 'questions', 'can_edit',
             'snapshot_data', 'snapshot_version',
             'school_id', 'school_name', 'owner_id', 'owner_name',
@@ -128,11 +130,16 @@ class ExamSerializer(serializers.ModelSerializer):
         return obj.exam_questions.count()
 
     def get_participant_count(self, obj):
-        request = self.context.get('request')
-        user = getattr(request, 'user', None) if request else None
-        if not user or not user.is_authenticated:
-            return 0
-        return Participant.objects.filter(created_by=user).count()
+        """Number of participants assigned to this exam (ExamParticipant rows)."""
+        return ExamParticipant.objects.filter(exam=obj).count()
+
+    def get_participant_ids(self, obj):
+        """IDs of participants explicitly assigned to this exam (via ExamParticipant)."""
+        return list(
+            ExamParticipant.objects.filter(exam=obj)
+            .order_by('participant_id')
+            .values_list('participant_id', flat=True)
+        )
 
     def get_total_marks(self, obj):
         return float(obj.total_marks)
@@ -189,7 +196,7 @@ class ExamSerializer(serializers.ModelSerializer):
 
 
 class ExamCreateUpdateSerializer(serializers.ModelSerializer):
-    """Serializer for creating/updating exams with nested questions"""
+    """Serializer for creating/updating exams with nested questions and participant assignments."""
     questions = serializers.ListField(
         child=serializers.DictField(),
         write_only=True,
@@ -199,6 +206,16 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
             "'positive_marks': 1.0, 'negative_marks': 0.0, "
             "'is_optional': false, 'allow_revise': true}]"
         )
+    )
+    participant_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True,
+        required=False,
+        help_text=(
+            "List of Participant IDs assigned to this exam. On create, the listed participants are "
+            "linked to the exam. On update, the assignment is replaced with this list when provided "
+            "(omit the field to leave assignments untouched)."
+        ),
     )
     owner_user_id = serializers.IntegerField(required=False, allow_null=True)
 
@@ -215,6 +232,7 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
             'question_change_automatic',
             'status',
             'questions',
+            'participant_ids',
             'owner_user_id'
         ]
         read_only_fields = ['id']
@@ -287,11 +305,36 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         f"Question {idx + 1}: allow_revise must be a boolean"
                     )
-        
+
+        # Validate participant_ids when provided: every id must reference an existing Participant.
+        if 'participant_ids' in attrs:
+            raw_ids = attrs.get('participant_ids') or []
+            cleaned = []
+            for v in raw_ids:
+                try:
+                    pid = int(v)
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError(
+                        {'participant_ids': f'Invalid participant id: {v!r}'}
+                    )
+                cleaned.append(pid)
+            cleaned = list(dict.fromkeys(cleaned))  # dedupe, preserve order
+            if cleaned:
+                existing = set(
+                    Participant.objects.filter(id__in=cleaned).values_list('id', flat=True)
+                )
+                missing = [pid for pid in cleaned if pid not in existing]
+                if missing:
+                    raise serializers.ValidationError(
+                        {'participant_ids': f'Unknown participant id(s): {missing}'}
+                    )
+            attrs['participant_ids'] = cleaned
+
         return attrs
 
     def create(self, validated_data):
         questions_data = validated_data.pop('questions', [])
+        participant_ids = validated_data.pop('participant_ids', None)
         owner_user_id = validated_data.pop('owner_user_id', None)
         request_user = self.context['request'].user
         try:
@@ -326,7 +369,14 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
                 is_optional=q_data.get('is_optional', False),
                 allow_revise=q_data.get('allow_revise', True),
             )
-        
+
+        # Assign participants if provided
+        if participant_ids:
+            ExamParticipant.objects.bulk_create(
+                [ExamParticipant(exam=exam, participant_id=pid) for pid in participant_ids],
+                ignore_conflicts=True,
+            )
+
         return exam
 
     def update(self, instance, validated_data):
@@ -335,6 +385,10 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Cannot edit a frozen exam")
 
         questions_data = validated_data.pop('questions', None)
+        # Distinguish "field not sent" (leave assignments untouched) from
+        # "field sent as empty list" (clear all assignments).
+        has_participants_field = 'participant_ids' in validated_data
+        participant_ids = validated_data.pop('participant_ids', None) if has_participants_field else None
         owner_user_id = validated_data.pop('owner_user_id', None)
         request_user = self.context['request'].user
         try:
@@ -370,7 +424,23 @@ class ExamCreateUpdateSerializer(serializers.ModelSerializer):
                     is_optional=q_data.get('is_optional', False),
                     allow_revise=q_data.get('allow_revise', True),
                 )
-        
+
+        # Replace participant assignments if the field was sent (including empty list).
+        if has_participants_field:
+            new_ids = set(participant_ids or [])
+            existing_ids = set(
+                ExamParticipant.objects.filter(exam=instance).values_list('participant_id', flat=True)
+            )
+            to_add = new_ids - existing_ids
+            to_remove = existing_ids - new_ids
+            if to_remove:
+                ExamParticipant.objects.filter(exam=instance, participant_id__in=to_remove).delete()
+            if to_add:
+                ExamParticipant.objects.bulk_create(
+                    [ExamParticipant(exam=instance, participant_id=pid) for pid in to_add],
+                    ignore_conflicts=True,
+                )
+
         return instance
 
 

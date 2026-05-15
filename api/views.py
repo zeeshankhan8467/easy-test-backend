@@ -327,7 +327,7 @@ class ExamViewSet(viewsets.ModelViewSet):
             last_attempt_submitted_at=Max('attempts__submitted_at'),
             last_attempt_started_at=Max('attempts__started_at'),
             attempt_count=Count('attempts', distinct=True),
-        )
+        ).order_by('-id')
 
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
@@ -3255,7 +3255,12 @@ def _format_attempted_option_label(question, selected_answer):
 
 
 def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
-    """Write 'Results by Participants(Detail)' sheet to match client format: metadata, then per-participant blocks with Keypad/Name line and table Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data."""
+    """Write 'Results by Participants(Detail)' sheet to match client format: metadata, then per-participant blocks with Keypad/Name line and table Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data.
+
+    Participant blocks are ordered by Keypad ID (natural-ish sort: shorter IDs first, then
+    lexicographic), matching the 'individual' workbook layout. The Ranking field per block
+    still reflects the score-based leaderboard order.
+    """
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
     if report_timestamp_str is None:
@@ -3283,6 +3288,15 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
     )
     rank_by_attempt_id = {a.id: rank for rank, a in enumerate(attempts_ranked, 1)}
     total_participants = len(attempts_ranked)
+    # Full report: walk participants in Keypad ID order (natural-ish: shorter ids first, then
+    # lexicographic). Ranking shown per block still comes from the score-based ordering above.
+    attempts_by_keypad = sorted(
+        attempts,
+        key=lambda a: (
+            len((a.participant.clicker_id or '') or ''),
+            (a.participant.clicker_id or '') or '',
+        ),
+    )
 
     row_num = 1
     ws.cell(row=row_num, column=1, value='Results by Participants(Detail)')
@@ -3307,7 +3321,7 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
         row_num += 1
     row_num += 1
 
-    for attempt in attempts_ranked:
+    for attempt in attempts_by_keypad:
         participant = attempt.participant
         keypad = getattr(participant, 'clicker_id', None) or participant.name or str(participant.id)
         user_row = _participant_report_row(participant)
