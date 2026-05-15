@@ -2284,13 +2284,18 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                 base_qs = base_qs.filter(created_by_id=tid)
         if exam_id:
             # Validate the exam is visible to the logged-in user.
-            # For participant listing, return the user's scoped participants
-            # rather than only exam-assigned participants.
+            # By default, return the user's scoped participants (not only
+            # exam-assigned). Pass `exam_only=1` to restrict to participants
+            # linked to this exam via ExamParticipant — used by the EasyTest
+            # Live app so only added participants can submit responses.
             exam_qs = scope_exams_queryset(Exam.objects.all(), user)
             try:
                 exam_qs.get(id=exam_id)
             except Exam.DoesNotExist:
                 return Participant.objects.none()
+            exam_only_raw = (self.request.query_params.get('exam_only') or '').strip().lower()
+            if exam_only_raw in ('1', 'true', 'yes', 'on'):
+                base_qs = base_qs.filter(participant_exams__exam_id=exam_id).distinct()
         class_param = (self.request.query_params.get('class') or '').strip()
         if class_param:
             base_qs = base_qs.filter(extra__class=class_param)
