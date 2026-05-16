@@ -1480,7 +1480,13 @@ def daily_attendance_save(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def daily_attendance_export(request):
-    """GET /api/attendance/day/export/?date=YYYY-MM-DD&file_format=excel|pdf"""
+    """GET /api/attendance/day/export/?date=YYYY-MM-DD&file_format=excel|pdf
+
+    Optional filters (mirror the Attendance page UI):
+
+    * `class`, `section`, `team` — exact match on `Participant.extra.<key>`.
+    * `status` — `present` (default) | `absent` | `unmarked` | `all`.
+    """
     d = _parse_iso_date(request.query_params.get('date'))
     if not d:
         return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1489,6 +1495,21 @@ def daily_attendance_export(request):
     pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
         Length('clicker_id'), 'clicker_id'
     )
+
+    class_param = (request.query_params.get('class') or '').strip()
+    section_param = (request.query_params.get('section') or '').strip()
+    team_param = (request.query_params.get('team') or '').strip()
+    if class_param:
+        pqs = pqs.filter(extra__class=class_param)
+    if section_param:
+        pqs = pqs.filter(extra__section=section_param)
+    if team_param:
+        pqs = pqs.filter(extra__team=team_param)
+
+    raw_status = (request.query_params.get('status') or 'present').strip().lower()
+    if raw_status not in ('present', 'absent', 'unmarked', 'all'):
+        raw_status = 'present'
+
     pids = list(pqs.values_list('id', flat=True))
     records = {}
     if pids:
@@ -1505,9 +1526,19 @@ def daily_attendance_export(request):
             status_label = 'Not recorded'
         else:
             status_label = 'Present' if rec.present else 'Absent'
+        # Apply status scope to the export so it matches the user's on-screen view.
+        if raw_status == 'present' and status_label != 'Present':
+            continue
+        if raw_status == 'absent' and status_label != 'Absent':
+            continue
+        if raw_status == 'unmarked' and status_label != 'Not recorded':
+            continue
         rows.append({
             'Name': p.name,
             'Keypad ID': p.clicker_id,
+            'Class': ex['class_name'],
+            'Section': ex['section'],
+            'Team': ex['team'],
             'Email': p.email or '',
             'Parent Email ID': ex['parent_email_id'],
             'Parent WhatsApp': ex['parent_whatsapp'],
@@ -1517,10 +1548,14 @@ def daily_attendance_export(request):
     raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
     format_type = 'pdf' if raw in ('pdf',) else 'excel'
     filename_base = f'attendance-daily-{d.isoformat()}'
+    columns = [
+        'Name', 'Keypad ID', 'Class', 'Section', 'Team',
+        'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status',
+    ]
 
     if format_type == 'excel':
         output = BytesIO()
-        df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status'])
+        df = pd.DataFrame(rows, columns=columns)
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Attendance', index=False)
         output.seek(0)
@@ -1535,15 +1570,25 @@ def daily_attendance_export(request):
     doc = SimpleDocTemplate(output, pagesize=A4)
     styles = getSampleStyleSheet()
     title = f'Daily Attendance — {d.strftime("%d/%m/%Y")}'
+    scope_bits = []
+    if class_param:
+        scope_bits.append(f'Class: {class_param}')
+    if section_param:
+        scope_bits.append(f'Section: {section_param}')
+    if team_param:
+        scope_bits.append(f'Team: {team_param}')
+    if raw_status != 'all':
+        scope_bits.append(f'Status: {raw_status.title()}')
+    subtitle = ' · '.join(scope_bits) if scope_bits else 'All participants'
     elements = [
         Paragraph(title, styles['Title']),
+        Spacer(1, 6),
+        Paragraph(subtitle, styles['Normal']),
         Spacer(1, 12),
         Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
         Spacer(1, 12),
     ]
-    table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status']] + [
-        [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Parent WhatsApp'], r['Status']] for r in rows
-    ]
+    table_data = [columns] + [[r[c] for c in columns] for r in rows]
     table = Table(table_data, repeatRows=1, hAlign='LEFT')
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
