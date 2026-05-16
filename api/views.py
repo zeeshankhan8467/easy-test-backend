@@ -1309,6 +1309,11 @@ def _daily_att_extra_row(p):
             or extra.get('parent_mobile')
             or ''
         ),
+        # Surface roster grouping fields so the Attendance page can filter by
+        # class / section / team without a separate participants round-trip.
+        'class_name': str(extra.get('class', '') or '').strip(),
+        'section': str(extra.get('section', '') or '').strip(),
+        'team': str(extra.get('team', '') or '').strip(),
     }
 
 
@@ -1401,6 +1406,9 @@ def daily_attendance_day(request):
             'clicker_id': p.clicker_id,
             'parent_email_id': ex['parent_email_id'],
             'parent_whatsapp': ex['parent_whatsapp'],
+            'class_name': ex['class_name'],
+            'section': ex['section'],
+            'team': ex['team'],
             'present': present,
             'marked': marked,
         })
