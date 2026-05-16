@@ -2225,6 +2225,11 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         elif od in ('alpha', 'letter', 'a', 'abc'):
                             option_display = 'alpha'
 
+                    # Tag imported questions with their creator (and school via the user's
+                    # profile when available) so the row is visible to the uploader's RBAC
+                    # scope. Without this, school_admin / teacher list views filter the
+                    # questions out (created_by IS NULL) — only super_admin would see them,
+                    # which is why imports appeared to "do nothing" on production.
                     Question.objects.create(
                         text=text,
                         type=qtype,
@@ -2233,7 +2238,8 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         option_display=option_display,
                         difficulty=diff,
                         tags=tags_list,
-                        marks=marks_val
+                        marks=marks_val,
+                        created_by=request.user,
                     )
                     imported += 1
                 except Exception as e:
@@ -2514,6 +2520,10 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                 reserved.add(email_col)
             imported = 0
             errors = []
+            # Track keys already imported from THIS file so that two rows sharing
+            # the same (clicker_id, class, section) don't quietly overwrite each
+            # other — instead the second occurrence is reported as a duplicate.
+            seen_keys = {}
             for idx, row in df.iterrows():
                 try:
                     raw_clicker = row.get(clicker_col, '')
@@ -2569,6 +2579,22 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     # so an import row only updates an existing participant when class & section also match.
                     cls_val = str(extra.get('class', '') or '').strip()
                     section_val = str(extra.get('section', '') or '').strip()
+                    dup_key = (clicker_id, cls_val, section_val)
+                    if dup_key in seen_keys:
+                        first_row = seen_keys[dup_key]
+                        scope_bits = []
+                        if cls_val:
+                            scope_bits.append(f'class "{cls_val}"')
+                        if section_val:
+                            scope_bits.append(f'section "{section_val}"')
+                        scope_label = ' and '.join(scope_bits) if scope_bits else 'no class/section'
+                        errors.append(
+                            f'Row {idx + 2}: Skipped — Clicker ID "{clicker_id}" in {scope_label} '
+                            f'is already used by row {first_row}. Each participant must have a unique '
+                            f'keypad ID within the same class & section.'
+                        )
+                        continue
+                    seen_keys[dup_key] = idx + 2
                     match_qs = Participant.objects.filter(
                         created_by=request.user, clicker_id=clicker_id,
                     )
@@ -2608,8 +2634,13 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     imported += 1
                 except Exception as e:
                     errors.append(f"Row {idx + 2}: {str(e)}")
-            
-            return Response({'imported': imported, 'errors': errors})
+
+            skipped_duplicates = sum(1 for e in errors if 'Skipped — Clicker ID' in e)
+            return Response({
+                'imported': imported,
+                'errors': errors,
+                'skipped_duplicates': skipped_duplicates,
+            })
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
