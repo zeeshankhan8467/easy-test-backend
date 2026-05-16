@@ -3925,6 +3925,25 @@ def dashboard(request):
     participants_qs = scope_participants_queryset(Participant.objects.all(), user)
     total_participants = participants_qs.count()
     
+    # Per-exam total marks (sum of ExamQuestion.positive_marks). Cached so the
+    # loops below don't trigger a fresh aggregate query for every attempt.
+    def _exam_total_marks(exam_obj, cache):
+        if exam_obj.id in cache:
+            return cache[exam_obj.id]
+        try:
+            v = float(exam_obj.total_marks or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v <= 0:
+            try:
+                v = float(exam_obj.positive_marking or 0)
+            except (TypeError, ValueError):
+                v = 0.0
+        cache[exam_obj.id] = v
+        return v
+
+    exam_total_marks_cache = {}
+
     # Calculate average score from all attempts (only for user's visible exams)
     all_attempts = ExamAttempt.objects.filter(exam__in=exams).select_related('exam')
     if all_attempts.exists():
@@ -3932,7 +3951,10 @@ def dashboard(request):
         count = 0
         for attempt in all_attempts:
             if attempt.total_questions > 0:
-                percentage = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
+                max_marks = _exam_total_marks(attempt.exam, exam_total_marks_cache)
+                if max_marks <= 0:
+                    continue
+                percentage = (float(attempt.score) / max_marks) * 100
                 total_percentage += percentage
                 count += 1
         avg_score = total_percentage / count if count > 0 else 0
@@ -3959,9 +3981,10 @@ def dashboard(request):
         if attempts.exists():
             total_percentage = 0
             count = 0
+            max_marks = _exam_total_marks(exam, exam_total_marks_cache)
             for attempt in attempts:
-                if attempt.total_questions > 0:
-                    percentage = (float(attempt.score) / (attempt.total_questions * float(exam.positive_marking))) * 100
+                if attempt.total_questions > 0 and max_marks > 0:
+                    percentage = (float(attempt.score) / max_marks) * 100
                     total_percentage += percentage
                     count += 1
             avg_exam_score = total_percentage / count if count > 0 else 0
@@ -3992,7 +4015,10 @@ def dashboard(request):
             count = 0
             for attempt in day_attempts:
                 if attempt.total_questions > 0:
-                    percentage = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
+                    max_marks = _exam_total_marks(attempt.exam, exam_total_marks_cache)
+                    if max_marks <= 0:
+                        continue
+                    percentage = (float(attempt.score) / max_marks) * 100
                     total_percentage += percentage
                     count += 1
             avg_day_score = total_percentage / count if count > 0 else 0
@@ -4078,9 +4104,22 @@ def _build_student_performance_rows(user, query_params):
             'teacher_name': (extra.get('teacher_name') or '').strip() if isinstance(extra, dict) else '',
             'subject': (extra.get('subject') or '').strip() if isinstance(extra, dict) else '',
         }
+        # Percentage uses the exam's real total marks (sum of ExamQuestion.positive_marks).
+        # Fall back to the legacy single-value `Exam.positive_marking` only when no
+        # per-question marks are recorded yet (rare, draft exams).
         pct = 0.0
-        if attempt.total_questions and float(getattr(attempt.exam, 'positive_marking', 1) or 1) > 0:
-            pct = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
+        try:
+            max_marks = float(getattr(attempt.exam, 'total_marks', 0) or 0)
+        except (TypeError, ValueError):
+            max_marks = 0.0
+        if max_marks <= 0:
+            try:
+                legacy = float(getattr(attempt.exam, 'positive_marking', 0) or 0)
+            except (TypeError, ValueError):
+                legacy = 0.0
+            max_marks = (attempt.total_questions or 0) * legacy
+        if attempt.total_questions and max_marks > 0:
+            pct = (float(attempt.score) / max_marks) * 100
         row['total_percentage'] = round(pct, 2)
 
         if admission_no and admission_no not in (row['admission_no'] or '').lower():

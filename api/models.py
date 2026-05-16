@@ -254,9 +254,29 @@ class ExamAttempt(models.Model):
 
     @property
     def percentage(self):
+        """Score as a percentage of the exam's real total marks.
+
+        Uses the sum of `ExamQuestion.positive_marks` (exposed via `Exam.total_marks`)
+        rather than the legacy single-value `Exam.positive_marking` field, which only
+        held a fallback "1.0" for older exams and produced inflated percentages
+        (e.g. 200%) when individual questions were worth more than 1 mark.
+        """
         if self.total_questions == 0:
             return 0
-        return (self.score / (self.total_questions * self.exam.positive_marking)) * 100
+        try:
+            max_marks = float(self.exam.total_marks or 0)
+        except (TypeError, ValueError):
+            max_marks = 0.0
+        if max_marks <= 0:
+            # Fallback for exams that have no per-question marks recorded yet.
+            try:
+                legacy = float(self.exam.positive_marking or 0)
+            except (TypeError, ValueError):
+                legacy = 0.0
+            max_marks = self.total_questions * legacy
+        if max_marks <= 0:
+            return 0
+        return (float(self.score) / max_marks) * 100
 
 
 class Answer(models.Model):
