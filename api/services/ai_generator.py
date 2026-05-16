@@ -4,21 +4,27 @@ Supports OpenAI GPT models for generating educational questions
 """
 import json
 import os
+from pathlib import Path
 from typing import List, Dict, Any
 from openai import OpenAI
 from django.conf import settings
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+# Ensure .env is loaded when Django hasn't imported settings yet (e.g. isolated tests)
+_env_file = Path(__file__).resolve().parent.parent.parent / '.env'
+load_dotenv(_env_file)
 
 class AIQuestionGenerator:
     def __init__(self):
         api_key = os.getenv('OPENAI_API_KEY', '')
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable is not set")
-        self.client = OpenAI(api_key=api_key)
-        self.model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')  # Default to cheaper model
+        client_kwargs = {'api_key': api_key}
+        base_url = (os.getenv('OPENAI_BASE_URL') or '').strip()
+        if base_url:
+            client_kwargs['base_url'] = base_url.rstrip('/')
+        self.client = OpenAI(**client_kwargs)
+        self.model = os.getenv('OPENAI_MODEL', 'gpt-4o-mini')  # e.g. gpt-4o, gpt-4o-mini, gpt-4.1-mini
     
     def _build_prompt(self, topic: str, count: int, difficulty: str, qtype: str, num_options: int = 4) -> str:
         """Build a prompt for AI question generation"""
@@ -112,18 +118,20 @@ IMPORTANT FORMATTING RULES:
 - For True/False: correct_answer is 0 (True) or 1 (False)
 - For Multiple Select: correct_answer is an array like [0, 2]
 
-Return ONLY a valid JSON array of question objects. No additional text or markdown formatting.
-Example format:
-[
+Return ONLY a valid JSON object with a single key "questions" whose value is an array of exactly {count} question objects. No markdown or code fences.
+
+Example shape:
+{{"questions": [
   {{
-    "question": "What is...?",
+    "question": "<p>What is...</p>",
     "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
     "correct_answer": 0,
+    "marks": 1.0,
     "explanation": "This is correct because..."
   }}
-]
+]}}
 
-Generate {count} questions now:"""
+Generate exactly {count} questions now."""
         
         return prompt
     
@@ -144,22 +152,28 @@ Generate {count} questions now:"""
         try:
             prompt = self._build_prompt(topic, count, difficulty, qtype, num_options)
             
-            response = self.client.chat.completions.create(
+            create_kwargs = dict(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert educational content creator. Always return valid JSON arrays only, no markdown formatting."
+                        "content": (
+                            'You are an expert educational content creator. '
+                            'Return only valid JSON: one object with a "questions" array.'
+                        ),
                     },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "user", "content": prompt},
                 ],
                 temperature=0.7,
-                max_tokens=2000 * count,  # Rough estimate: ~2000 tokens per question
-                response_format={"type": "json_object"} if count == 1 else None
+                max_tokens=min(32000, max(2048, 900 * count)),
             )
+            # Structured output improves reliability for GPT-4.x / 4o / 4o-mini
+            try:
+                create_kwargs["response_format"] = {"type": "json_object"}
+                response = self.client.chat.completions.create(**create_kwargs)
+            except Exception:
+                create_kwargs.pop("response_format", None)
+                response = self.client.chat.completions.create(**create_kwargs)
             
             content = response.choices[0].message.content.strip()
             
@@ -175,18 +189,16 @@ Generate {count} questions now:"""
             # Parse JSON response
             try:
                 parsed = json.loads(content)
-                
+
                 # Handle different response formats
                 if isinstance(parsed, list):
                     questions = parsed
                 elif isinstance(parsed, dict):
-                    # Check if it's a wrapper object
-                    if 'questions' in parsed:
+                    if 'questions' in parsed and isinstance(parsed['questions'], list):
                         questions = parsed['questions']
                     elif 'question' in parsed:
                         questions = [parsed]
                     else:
-                        # Assume it's a single question object
                         questions = [parsed]
                 else:
                     raise ValueError("Unexpected response format")

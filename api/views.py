@@ -16,6 +16,7 @@ from django.db.models import Q, Count, Avg, Max, Min, Sum
 from django.db.models.functions import Length
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET
 from django.core.mail import EmailMessage, get_connection
 from rest_framework_simplejwt.authentication import JWTAuthentication
@@ -39,6 +40,35 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_live_sync_datetime(raw):
+    """
+    Parse ISO datetimes from EasyTest Live / clients that use IST (+05:30) in payloads.
+
+    If the string has no timezone (naive), treat wall time as Asia/Kolkata — not as
+    Django's default TIME_ZONE (often UTC). Otherwise naive values meant as IST are
+    stored ~5.5h wrong and computed time_taken (when client omits time_taken) breaks on prod.
+    """
+    if raw is None or raw == '':
+        return None
+    s = str(raw).strip().replace('Z', '+00:00')
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    ist = ZoneInfo('Asia/Kolkata')
+    dt = parse_datetime(s)
+    if dt is None:
+        try:
+            from datetime import datetime as dt_mod
+            dt = dt_mod.fromisoformat(s)
+        except (ValueError, TypeError):
+            return None
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, ist)
+    return dt
+
 
 def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
     """
@@ -103,11 +133,11 @@ def _msg91_send_whatsapp_text(recipient_number: str, text: str) -> dict:
         raise RuntimeError(f'Msg91 request failed: {str(e)}')
 
 
-def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
+def _msg91_send_whatsapp_template(recipient_number: str, body_vars: dict) -> dict:
     """
-    Send WhatsApp outbound message using a pre-approved WhatsApp template (single body component).
+    Send WhatsApp outbound message using a pre-approved WhatsApp template.
 
-    This code assumes your template's body has exactly ONE dynamic variable, and MSG91 will map it to `body_1`.
+    Supports templates with body variables: body_1, body_2, body_3, body_4 (send only those provided).
 
     Required env vars:
       - MSG91_AUTHKEY
@@ -138,10 +168,28 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
         raise ValueError('Missing MSG91_WHATSAPP_TEMPLATE_OUTBOUND_URL in environment.')
     if not recipient_number:
         raise ValueError('Missing recipient_number.')
-    if text is None:
-        text = ''
+    if body_vars is None or not isinstance(body_vars, dict):
+        body_vars = {}
 
-    # We send the full rendered message as the single body parameter (body_1).
+    def _msg91_template_value(raw) -> str:
+        """
+        MSG91 template body values do not support newline characters.
+        Normalize any multiline text into a single line with spaces.
+        """
+        text = str(raw or "")
+        text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        # Collapse repeated whitespace after newline replacement.
+        return " ".join(text.split())
+
+    # MSG91 expects body_N keys under "components". We only include provided values.
+    components = {}
+    for k in ("body_1", "body_2", "body_3", "body_4"):
+        if k in body_vars and body_vars.get(k) is not None:
+            components[k] = {"type": "text", "value": _msg91_template_value(body_vars.get(k))}
+    if not components:
+        # Keep API contract consistent: at least body_1 must exist for most templates.
+        components["body_1"] = {"type": "text", "value": ""}
+
     payload = {
         'integrated_number': integrated_number,
         'content_type': 'template',
@@ -158,12 +206,7 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
                 'to_and_components': [
                     {
                         'to': [recipient_number],
-                        'components': {
-                            'body_1': {
-                                'type': 'text',
-                                'value': text,
-                            }
-                        },
+                        'components': components,
                     }
                 ],
             }
@@ -201,14 +244,14 @@ def _msg91_send_whatsapp_template(recipient_number: str, text: str) -> dict:
         raise RuntimeError(f'Msg91 request failed: {str(e)}')
 
 
-def _msg91_send_whatsapp_message(recipient_number: str, text: str) -> dict:
+def _msg91_send_whatsapp_message(recipient_number: str, text: str, body_vars: dict | None = None) -> dict:
     """
     Choose template-based sending if template env vars are configured,
     otherwise fall back to text sending.
     """
     template_name = (os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip()
     return (
-        _msg91_send_whatsapp_template(recipient_number, text)
+        _msg91_send_whatsapp_template(recipient_number, body_vars or {'body_1': text})
         if template_name
         else _msg91_send_whatsapp_text(recipient_number, text)
     )
@@ -280,12 +323,21 @@ class ExamViewSet(viewsets.ModelViewSet):
                     qs = qs.filter(created_by_id=int(owner_user_id))
                 except (ValueError, TypeError):
                     pass
-        return qs
-    
+        return qs.annotate(
+            last_attempt_submitted_at=Max('attempts__submitted_at'),
+            last_attempt_started_at=Max('attempts__started_at'),
+            attempt_count=Count('attempts', distinct=True),
+        ).order_by('-id')
+
     def get_serializer_class(self):
         if self.action in ['create', 'update', 'partial_update']:
             return ExamCreateUpdateSerializer
         return ExamSerializer
+
+    def _exam_serializer_data(self, exam):
+        """Serialize with attempt aggregates (annotated queryset); fallback if exam not in scope."""
+        annotated = self.get_queryset().filter(pk=exam.pk).first()
+        return ExamSerializer(annotated or exam, context={'request': self.request}).data
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -294,7 +346,10 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Allow creating exam without questions (draft mode)
         # Questions can be added later before freezing
         exam = serializer.save()
-        return Response(ExamSerializer(exam).data, status=status.HTTP_201_CREATED)
+        return Response(
+            self._exam_serializer_data(exam),
+            status=status.HTTP_201_CREATED,
+        )
     
     def update(self, request, *args, **kwargs):
         exam = self.get_object()
@@ -312,7 +367,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Allow removing all questions (draft mode)
         # But validate before freezing
         exam = serializer.save()
-        return Response(ExamSerializer(exam).data)
+        return Response(self._exam_serializer_data(exam))
 
     @action(detail=True, methods=['post'])
     def freeze(self, request, pk=None):
@@ -372,6 +427,7 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'positive_marks': float(eq.positive_marks),
                 'negative_marks': float(eq.negative_marks),
                 'is_optional': eq.is_optional,
+                'allow_revise': bool(getattr(eq, 'allow_revise', True)),
             })
         
         # Generate version/checksum
@@ -385,7 +441,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         exam.snapshot_version = snapshot_version
         exam.save()
         
-        return Response(ExamSerializer(exam).data)
+        return Response(self._exam_serializer_data(exam))
 
     @action(detail=True, methods=['get'], url_path='export')
     def export_report_action(self, request, pk=None):
@@ -396,13 +452,50 @@ class ExamViewSet(viewsets.ModelViewSet):
             return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
         return _build_export_http_response(request, exam)
 
+    @staticmethod
+    def _distinct_tags_for_questions(queryset, max_rows=2500):
+        """Collect unique tag strings from question rows (sample cap for performance)."""
+        tags = set()
+        for row in queryset.values_list('tags', flat=True)[:max_rows]:
+            if isinstance(row, list):
+                for t in row:
+                    s = str(t).strip() if t is not None else ''
+                    if s:
+                        tags.add(s)
+        return sorted(tags, key=lambda x: (x.lower(), x))
+
+    @staticmethod
+    def _filter_questions_by_tag_exact(queryset, tag_param):
+        """Exact string match on a tag in ``Question.tags`` (JSON list).
+
+        Avoids ``tags__contains`` which raises NotSupportedError on SQLite and some backends.
+        """
+        tag_param = (tag_param or '').strip()
+        if not tag_param:
+            return queryset
+        matching_ids = [
+            pk
+            for pk, tags in queryset.values_list('id', 'tags').iterator(chunk_size=500)
+            if isinstance(tags, list) and any(str(t).strip() == tag_param for t in tags)
+        ]
+        if not matching_ids:
+            return queryset.none()
+        return queryset.filter(id__in=matching_ids)
+
     @action(detail=False, methods=['get'])
     def available_questions(self, request):
-        """Get available questions for selection (not already in exam). Scoped by role."""
+        """Get available questions for selection (not already in exam). Scoped by role.
+
+        Query params: exam_id, difficulty, type, search, tag (exact match on a tag string).
+
+        Response: ``{"questions": [...], "tags": [...]}`` — ``tags`` lists distinct tags in the
+        current filter scope (before ``tag``), for building a filter dropdown.
+        """
         exam_id = request.query_params.get('exam_id')
         difficulty = request.query_params.get('difficulty')
         qtype = request.query_params.get('type')
         search = request.query_params.get('search', '')
+        tag_param = (request.query_params.get('tag') or '').strip()
 
         # Scope by role: Super Admin all, School Admin same school, Teacher own only
         user = request.user
@@ -423,15 +516,15 @@ class ExamViewSet(viewsets.ModelViewSet):
         # Filter by difficulty
         if difficulty and difficulty != 'all':
             queryset = queryset.filter(difficulty=difficulty)
-        
+
         # Filter by type
         if qtype and qtype != 'all':
             queryset = queryset.filter(type=qtype)
-        
+
         # Search in text
         if search:
             queryset = queryset.filter(text__icontains=search)
-        
+
         # Exclude questions already in exam (if editing)
         if exam_id:
             try:
@@ -440,9 +533,14 @@ class ExamViewSet(viewsets.ModelViewSet):
                 queryset = queryset.exclude(id__in=existing_question_ids)
             except Exam.DoesNotExist:
                 pass
-        
-        serializer = QuestionSerializer(queryset[:100], many=True)  # Limit to 100
-        return Response(serializer.data)
+
+        tags_for_ui = ExamViewSet._distinct_tags_for_questions(queryset)
+
+        if tag_param:
+            queryset = ExamViewSet._filter_questions_by_tag_exact(queryset, tag_param)
+
+        serializer = QuestionSerializer(queryset[:100], many=True)
+        return Response({'questions': serializer.data, 'tags': tags_for_ui})
 
     @action(detail=True, methods=['get'])
     def snapshot(self, request, pk=None):
@@ -487,6 +585,7 @@ class ExamViewSet(viewsets.ModelViewSet):
                     'positive_marks': float(eq.positive_marks),
                     'negative_marks': float(eq.negative_marks),
                     'is_optional': eq.is_optional,
+                    'allow_revise': bool(getattr(eq, 'allow_revise', True)),
                 })
         
         # Include version for client validation (only when frozen)
@@ -525,16 +624,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         responses_data = request.data.get('responses', [])
         attendance_ids = request.data.get('attendance', [])
         exam_started_at_raw = request.data.get('exam_started_at')
-        exam_started_at_parsed = None
-        if exam_started_at_raw:
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(str(exam_started_at_raw).replace('Z', '+00:00'))
-                if timezone.is_naive(dt):
-                    dt = timezone.make_aware(dt)
-                exam_started_at_parsed = dt
-            except (ValueError, TypeError):
-                pass
+        exam_started_at_parsed = _parse_live_sync_datetime(exam_started_at_raw)
         logger.info(
             '[sync_live_results] TIME_TAKEN DEBUG: exam_started_at raw=%s parsed=%s',
             exam_started_at_raw, exam_started_at_parsed
@@ -545,16 +635,7 @@ class ExamViewSet(viewsets.ModelViewSet):
         )
 
         def _parse_answered_at_for_sync(raw):
-            if not raw:
-                return None
-            try:
-                from datetime import datetime
-                dt = datetime.fromisoformat(str(raw).replace('Z', '+00:00'))
-                if timezone.is_naive(dt):
-                    dt = timezone.make_aware(dt)
-                return dt
-            except (ValueError, TypeError):
-                return None
+            return _parse_live_sync_datetime(raw)
 
         def _response_chronological_key(item):
             dt = _parse_answered_at_for_sync(item.get('answered_at'))
@@ -586,6 +667,7 @@ class ExamViewSet(viewsets.ModelViewSet):
                     'correct_answer': eq.question.correct_answer,
                     'positive_marks': float(eq.positive_marks),
                     'negative_marks': float(eq.negative_marks),
+                    'allow_revise': bool(getattr(eq, 'allow_revise', True)),
                 }
 
         # Resolve participant by id or clicker_id; create one from clicker_id if missing (e.g. deviceId fallback when SDK keySN is empty)
@@ -745,9 +827,10 @@ class ExamViewSet(viewsets.ModelViewSet):
             answered_dt = _parse_answered_at_for_sync(item.get('answered_at'))
             time_taken = 0
             used_client_time = False
-            if 'time_taken' in item:
+            tt_raw = item.get('time_taken')
+            if tt_raw is not None:
                 try:
-                    time_taken = max(0, int(item.get('time_taken')))
+                    time_taken = max(0, int(float(tt_raw)))
                     used_client_time = True
                 except (TypeError, ValueError):
                     used_client_time = False
@@ -786,8 +869,10 @@ class ExamViewSet(viewsets.ModelViewSet):
             answer_at_to_store = answered_dt if answered_dt else timezone.now()
 
             existing = Answer.objects.filter(attempt=attempt, question_id=question_id).first()
+            question_allows_revise = bool(qinfo.get('allow_revise', True))
+            can_revise = exam.revisable and question_allows_revise
             if existing:
-                if exam.revisable:
+                if can_revise:
                     existing.selected_answer = selected if isinstance(selected, list) else [selected]
                     existing.is_correct = correct
                     existing.time_taken = time_taken
@@ -832,8 +917,15 @@ class ExamViewSet(viewsets.ModelViewSet):
             attempt.score = total_marks
             attempt.submitted_at = timezone.now()
             if answers.exists():
-                # Sum per-question seconds so leaderboard / exports match "Speed" column totals.
-                attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
+                # Sum only current exam questions so DB matches Speed column / leaderboard.
+                qids = set(exam.exam_questions.values_list('question_id', flat=True))
+                if qids:
+                    attempt.time_taken = max(
+                        0,
+                        sum(a.time_taken or 0 for a in answers if a.question_id in qids),
+                    )
+                else:
+                    attempt.time_taken = max(0, sum(a.time_taken or 0 for a in answers))
             attempt.save()
 
         # Assign all listed participants to the exam and mark present those who responded
@@ -1091,11 +1183,12 @@ class ExamViewSet(viewsets.ModelViewSet):
         scope = (request.data.get('scope') or 'absent').strip().lower()
         participant_ids = request.data.get('participant_ids', None)
         message = (request.data.get('message') or '').strip()
+        template_enabled = bool((os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip())
         if scope not in ('present', 'absent', 'all'):
             return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
         if participant_ids is not None and not isinstance(participant_ids, list):
             return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
-        if not message:
+        if not message and not template_enabled:
             return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
 
         # Fail fast if msg91 is not configured
@@ -1167,8 +1260,19 @@ class ExamViewSet(viewsets.ModelViewSet):
                 'status': 'Present' if is_present else 'Absent',
             }
             try:
-                text = _render(message, ctx)
-                resp = _msg91_send_whatsapp_message(phone, text)
+                # If template mode: map to body_1..body_4 for your approved template.
+                if template_enabled:
+                    body_1 = _render(message, ctx) if message else (exam.title or "")
+                    body_vars = {
+                        "body_1": body_1,
+                        "body_2": p.name or "",
+                        "body_3": p.clicker_id or "",
+                        "body_4": 'Present' if is_present else 'Absent',
+                    }
+                    resp = _msg91_send_whatsapp_message(phone, body_1, body_vars=body_vars)
+                else:
+                    text = _render(message, ctx)
+                    resp = _msg91_send_whatsapp_message(phone, text)
                 msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
                 messages.append({
                     'participant_id': p.id,
@@ -1205,6 +1309,11 @@ def _daily_att_extra_row(p):
             or extra.get('parent_mobile')
             or ''
         ),
+        # Surface roster grouping fields so the Attendance page can filter by
+        # class / section / team without a separate participants round-trip.
+        'class_name': str(extra.get('class', '') or '').strip(),
+        'section': str(extra.get('section', '') or '').strip(),
+        'team': str(extra.get('team', '') or '').strip(),
     }
 
 
@@ -1297,6 +1406,9 @@ def daily_attendance_day(request):
             'clicker_id': p.clicker_id,
             'parent_email_id': ex['parent_email_id'],
             'parent_whatsapp': ex['parent_whatsapp'],
+            'class_name': ex['class_name'],
+            'section': ex['section'],
+            'team': ex['team'],
             'present': present,
             'marked': marked,
         })
@@ -1368,7 +1480,13 @@ def daily_attendance_save(request):
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def daily_attendance_export(request):
-    """GET /api/attendance/day/export/?date=YYYY-MM-DD&file_format=excel|pdf"""
+    """GET /api/attendance/day/export/?date=YYYY-MM-DD&file_format=excel|pdf
+
+    Optional filters (mirror the Attendance page UI):
+
+    * `class`, `section`, `team` — exact match on `Participant.extra.<key>`.
+    * `status` — `present` (default) | `absent` | `unmarked` | `all`.
+    """
     d = _parse_iso_date(request.query_params.get('date'))
     if not d:
         return Response({'error': 'Invalid or missing date (use YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1377,6 +1495,21 @@ def daily_attendance_export(request):
     pqs = scope_participants_queryset(Participant.objects.all(), user).order_by(
         Length('clicker_id'), 'clicker_id'
     )
+
+    class_param = (request.query_params.get('class') or '').strip()
+    section_param = (request.query_params.get('section') or '').strip()
+    team_param = (request.query_params.get('team') or '').strip()
+    if class_param:
+        pqs = pqs.filter(extra__class=class_param)
+    if section_param:
+        pqs = pqs.filter(extra__section=section_param)
+    if team_param:
+        pqs = pqs.filter(extra__team=team_param)
+
+    raw_status = (request.query_params.get('status') or 'present').strip().lower()
+    if raw_status not in ('present', 'absent', 'unmarked', 'all'):
+        raw_status = 'present'
+
     pids = list(pqs.values_list('id', flat=True))
     records = {}
     if pids:
@@ -1393,9 +1526,19 @@ def daily_attendance_export(request):
             status_label = 'Not recorded'
         else:
             status_label = 'Present' if rec.present else 'Absent'
+        # Apply status scope to the export so it matches the user's on-screen view.
+        if raw_status == 'present' and status_label != 'Present':
+            continue
+        if raw_status == 'absent' and status_label != 'Absent':
+            continue
+        if raw_status == 'unmarked' and status_label != 'Not recorded':
+            continue
         rows.append({
             'Name': p.name,
             'Keypad ID': p.clicker_id,
+            'Class': ex['class_name'],
+            'Section': ex['section'],
+            'Team': ex['team'],
             'Email': p.email or '',
             'Parent Email ID': ex['parent_email_id'],
             'Parent WhatsApp': ex['parent_whatsapp'],
@@ -1405,10 +1548,14 @@ def daily_attendance_export(request):
     raw = (request.GET.get('file_format') or request.GET.get('format') or 'excel').strip().lower()
     format_type = 'pdf' if raw in ('pdf',) else 'excel'
     filename_base = f'attendance-daily-{d.isoformat()}'
+    columns = [
+        'Name', 'Keypad ID', 'Class', 'Section', 'Team',
+        'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status',
+    ]
 
     if format_type == 'excel':
         output = BytesIO()
-        df = pd.DataFrame(rows, columns=['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status'])
+        df = pd.DataFrame(rows, columns=columns)
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Attendance', index=False)
         output.seek(0)
@@ -1423,15 +1570,25 @@ def daily_attendance_export(request):
     doc = SimpleDocTemplate(output, pagesize=A4)
     styles = getSampleStyleSheet()
     title = f'Daily Attendance — {d.strftime("%d/%m/%Y")}'
+    scope_bits = []
+    if class_param:
+        scope_bits.append(f'Class: {class_param}')
+    if section_param:
+        scope_bits.append(f'Section: {section_param}')
+    if team_param:
+        scope_bits.append(f'Team: {team_param}')
+    if raw_status != 'all':
+        scope_bits.append(f'Status: {raw_status.title()}')
+    subtitle = ' · '.join(scope_bits) if scope_bits else 'All participants'
     elements = [
         Paragraph(title, styles['Title']),
+        Spacer(1, 6),
+        Paragraph(subtitle, styles['Normal']),
         Spacer(1, 12),
         Paragraph(f'Generated at: {_report_datetime_ist()}', styles['Normal']),
         Spacer(1, 12),
     ]
-    table_data = [['Name', 'Keypad ID', 'Email', 'Parent Email ID', 'Parent WhatsApp', 'Status']] + [
-        [r['Name'], r['Keypad ID'], r['Email'], r['Parent Email ID'], r['Parent WhatsApp'], r['Status']] for r in rows
-    ]
+    table_data = [columns] + [[r[c] for c in columns] for r in rows]
     table = Table(table_data, repeatRows=1, hAlign='LEFT')
     table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
@@ -1562,11 +1719,12 @@ def daily_attendance_send_parent_whatsapp(request):
     scope = ((request.data or {}).get('scope') or 'absent').strip().lower()
     participant_ids = (request.data or {}).get('participant_ids', None)
     message = ((request.data or {}).get('message') or '').strip()
+    template_enabled = bool((os.getenv('MSG91_WHATSAPP_TEMPLATE_NAME') or '').strip())
     if scope not in ('present', 'absent', 'all', 'unmarked'):
         return Response({'error': 'Invalid scope'}, status=status.HTTP_400_BAD_REQUEST)
     if participant_ids is not None and not isinstance(participant_ids, list):
         return Response({'error': 'participant_ids must be a list'}, status=status.HTTP_400_BAD_REQUEST)
-    if not message:
+    if not message and not template_enabled:
         return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
 
     # Fail fast if msg91 is not configured
@@ -1645,8 +1803,19 @@ def daily_attendance_send_parent_whatsapp(request):
             'status': status_human,
         }
         try:
-            text = _render(message, ctx)
-            resp = _msg91_send_whatsapp_message(phone, text)
+            if template_enabled:
+                # body_1 should be the "Attendance update for ..." value; default to attendance date.
+                body_1 = _render(message, ctx) if message else attendance_date_label
+                body_vars = {
+                    "body_1": body_1,
+                    "body_2": p.name or "",
+                    "body_3": p.clicker_id or "",
+                    "body_4": status_human,
+                }
+                resp = _msg91_send_whatsapp_message(phone, body_1, body_vars=body_vars)
+            else:
+                text = _render(message, ctx)
+                resp = _msg91_send_whatsapp_message(phone, text)
             msg_id = resp.get('message_id') or resp.get('request_id') or resp.get('id')
             messages.append({
                 'participant_id': p.id,
@@ -1761,6 +1930,21 @@ class QuestionViewSet(viewsets.ModelViewSet):
 
         return qs.none()
 
+    @action(detail=False, methods=['post'], url_path='delete_all')
+    def delete_all(self, request):
+        """Delete every question in the current list scope (same query params as GET). Removes exam links (ExamQuestion). Body: {\"confirm\": true}."""
+        if request.data.get('confirm') is not True:
+            return Response(
+                {
+                    'error': 'Send JSON body {"confirm": true} to permanently delete all questions matching your current filters.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        qs = self.get_queryset()
+        n = qs.count()
+        qs.delete()
+        return Response({'deleted': n})
+
     def _normalize_topic(self, raw: str) -> str:
         """Ensure topic is a short label, not a full prompt (e.g. from mis-sent request)."""
         if not raw:
@@ -1841,40 +2025,40 @@ class QuestionViewSet(viewsets.ModelViewSet):
             option_display = 'alpha'
 
         try:
-            # Try AI generation: Groq first, then Gemini (free), then OpenAI
+            # AI generation order: env QUESTION_AI_PROVIDERS (comma-separated: openai, groq, gemini)
+            _raw_order = (os.getenv('QUESTION_AI_PROVIDERS') or 'openai,groq,gemini').strip().lower()
+            _provider_order = [
+                p.strip() for p in _raw_order.split(',')
+                if p.strip() in ('groq', 'gemini', 'openai')
+            ]
+            if not _provider_order:
+                _provider_order = ['openai', 'groq', 'gemini']
+
             ai_questions = []
             provider_used = None
-            try:
-                from api.services.ai_generator_groq import GroqQuestionGenerator
-                generator = GroqQuestionGenerator()
-                ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
+            for prov in _provider_order:
                 if ai_questions:
-                    provider_used = 'Groq'
-            except (ValueError, ImportError) as e:
-                logger.info("AI generate: Groq not used (%s)", e)
-                pass
-
-            if not ai_questions:
+                    break
                 try:
-                    from api.services.ai_generator_gemini import GeminiQuestionGenerator
-                    generator = GeminiQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
+                    if prov == 'groq':
+                        from api.services.ai_generator_groq import GroqQuestionGenerator
+                        generator = GroqQuestionGenerator()
+                        label = 'Groq'
+                    elif prov == 'gemini':
+                        from api.services.ai_generator_gemini import GeminiQuestionGenerator
+                        generator = GeminiQuestionGenerator()
+                        label = 'Gemini'
+                    else:
+                        from api.services.ai_generator import AIQuestionGenerator
+                        generator = AIQuestionGenerator()
+                        label = 'OpenAI'
+                    ai_questions = generator.generate_questions_safe(
+                        topic, count, difficulty, qtype, num_options=num_options
+                    )
                     if ai_questions:
-                        provider_used = 'Gemini'
+                        provider_used = label
                 except (ValueError, ImportError) as e:
-                    logger.info("AI generate: Gemini not used (%s)", e)
-                    pass
-
-            if not ai_questions:
-                try:
-                    from api.services.ai_generator import AIQuestionGenerator
-                    generator = AIQuestionGenerator()
-                    ai_questions = generator.generate_questions_safe(topic, count, difficulty, qtype, num_options=num_options)
-                    if ai_questions:
-                        provider_used = 'OpenAI'
-                except (ValueError, ImportError) as e:
-                    logger.info("AI generate: OpenAI not used (%s)", e)
-                    pass
+                    logger.info("AI generate: %s not used (%s)", prov, e)
 
             # If AI generation succeeded and returned questions
             if ai_questions:
@@ -1909,13 +2093,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 )
                 print(
                     "[EasyTest AI] No API key configured or AI returned no questions. "
-                    "Using sample questions. For real AI: add GROQ_API_KEY or GEMINI_API_KEY to .env (see FREE_AI_SETUP.md)"
+                    "Using sample questions. For real AI: set QUESTION_AI_PROVIDERS and add GROQ_API_KEY, GEMINI_API_KEY, and/or OPENAI_API_KEY in .env (see FREE_AI_SETUP.md)"
                 )
                 mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
                 return Response(
                     {
                         'questions': mock_data,
-                        'warning': 'AI generation unavailable. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI (see FREE_AI_SETUP.md).'
+                        'warning': 'AI generation unavailable. Sample questions generated. Configure QUESTION_AI_PROVIDERS and GROQ_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY in .env (see FREE_AI_SETUP.md).'
                     },
                     status=status.HTTP_201_CREATED
                 )
@@ -1925,13 +2109,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
             logger.warning("AI generate: ValueError (e.g. missing API key): %s", e)
             print(
                 "[EasyTest AI] API key not set. Using sample questions. "
-                "Add GROQ_API_KEY or GEMINI_API_KEY to backend .env (see FREE_AI_SETUP.md)"
+                "Add OPENAI_API_KEY and/or GROQ_API_KEY / GEMINI_API_KEY to backend .env (see FREE_AI_SETUP.md). Use QUESTION_AI_PROVIDERS=openai to prefer GPT."
             )
             mock_data = self._generate_mock_questions(topic, count, difficulty, qtype)
             return Response(
                 {
                     'questions': mock_data,
-                    'warning': 'API key not configured. Sample questions generated. Add GROQ_API_KEY or GEMINI_API_KEY to .env for real AI.'
+                    'warning': 'API key not configured. Sample questions generated. Add OPENAI_API_KEY (and QUESTION_AI_PROVIDERS=openai if desired) or GROQ / GEMINI keys in .env.'
                 },
                 status=status.HTTP_201_CREATED
             )
@@ -2094,6 +2278,11 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         elif od in ('alpha', 'letter', 'a', 'abc'):
                             option_display = 'alpha'
 
+                    # Tag imported questions with their creator (and school via the user's
+                    # profile when available) so the row is visible to the uploader's RBAC
+                    # scope. Without this, school_admin / teacher list views filter the
+                    # questions out (created_by IS NULL) — only super_admin would see them,
+                    # which is why imports appeared to "do nothing" on production.
                     Question.objects.create(
                         text=text,
                         type=qtype,
@@ -2102,7 +2291,8 @@ class QuestionViewSet(viewsets.ModelViewSet):
                         option_display=option_display,
                         difficulty=diff,
                         tags=tags_list,
-                        marks=marks_val
+                        marks=marks_val,
+                        created_by=request.user,
                     )
                     imported += 1
                 except Exception as e:
@@ -2152,14 +2342,79 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             if tid is not None:
                 base_qs = base_qs.filter(created_by_id=tid)
         if exam_id:
+            # Validate the exam is visible to the logged-in user.
+            # By default, return the user's scoped participants (not only
+            # exam-assigned). Pass `exam_only=1` to restrict to participants
+            # linked to this exam via ExamParticipant — used by the EasyTest
+            # Live app so only added participants can submit responses.
             exam_qs = scope_exams_queryset(Exam.objects.all(), user)
             try:
-                exam = exam_qs.get(id=exam_id)
+                exam_qs.get(id=exam_id)
             except Exam.DoesNotExist:
                 return Participant.objects.none()
-            participant_ids = ExamParticipant.objects.filter(exam=exam).values_list('participant_id', flat=True)
-            return base_qs.filter(id__in=participant_ids).order_by(*base_order)
+            exam_only_raw = (self.request.query_params.get('exam_only') or '').strip().lower()
+            if exam_only_raw in ('1', 'true', 'yes', 'on'):
+                base_qs = base_qs.filter(participant_exams__exam_id=exam_id).distinct()
+        class_param = (self.request.query_params.get('class') or '').strip()
+        if class_param:
+            base_qs = base_qs.filter(extra__class=class_param)
+        section_param = (self.request.query_params.get('section') or '').strip()
+        if section_param:
+            base_qs = base_qs.filter(extra__section=section_param)
+        team_param = (self.request.query_params.get('team') or '').strip()
+        if team_param:
+            base_qs = base_qs.filter(extra__team=team_param)
         return base_qs.order_by(*base_order)
+
+    def _distinct_extra_field(self, queryset, field_key):
+        """Distinct non-empty string values for extra[field_key]."""
+        key_path = f'extra__{field_key}'
+        rows = queryset.exclude(**{f'{key_path}__isnull': True}).exclude(**{key_path: ''}).values_list(key_path, flat=True)
+        seen = set()
+        out = []
+        for v in rows:
+            if v is None:
+                continue
+            s = str(v).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        out.sort(key=lambda x: (x.lower(), x))
+        return out
+
+    @action(detail=False, methods=['get'], url_path='distinct_classes')
+    def distinct_classes(self, request):
+        """Distinct non-empty `extra.class` for the current roster scope (do not pass `class`/`section`/`team` when populating this dropdown)."""
+        qs = self.get_queryset()
+        return Response({'classes': self._distinct_extra_field(qs, 'class')})
+
+    @action(detail=False, methods=['get'], url_path='distinct_sections')
+    def distinct_sections(self, request):
+        """Distinct `extra.section` for scope. Request may include `class` to narrow; do not pass `section`/`team` when populating this dropdown."""
+        qs = self.get_queryset()
+        return Response({'sections': self._distinct_extra_field(qs, 'section')})
+
+    @action(detail=False, methods=['get'], url_path='distinct_teams')
+    def distinct_teams(self, request):
+        """Distinct `extra.team` for scope. Request may include `class`, `section`; do not pass `team` when populating this dropdown."""
+        qs = self.get_queryset()
+        return Response({'teams': self._distinct_extra_field(qs, 'team')})
+
+    @action(detail=False, methods=['post'], url_path='delete_all')
+    def delete_all(self, request):
+        """Delete every participant in the current list scope (same query params as GET, except exam_id only validates exam). Cascades exam links, attempts, attendance. Body: {\"confirm\": true}."""
+        if request.data.get('confirm') is not True:
+            return Response(
+                {
+                    'error': 'Send JSON body {"confirm": true} to permanently delete all participants matching your current filters.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        qs = self.get_queryset()
+        n = qs.count()
+        qs.delete()
+        return Response({'deleted': n})
 
     def perform_create(self, serializer):
         """Set created_by and school on single participant create."""
@@ -2168,7 +2423,11 @@ class ParticipantViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def bulk_create(self, request):
-        """Create multiple participants in one request. Each item needs name and clicker_id; email optional."""
+        """Create multiple participants in one request. Each item needs clicker_id; name optional (defaults to clicker_id); email optional.
+
+        Uniqueness for `clicker_id` is scoped to (created_by, extra.class, extra.section) so the
+        same keypad ID can exist in different sections (even within the same class).
+        """
         from .serializers import ParticipantBulkCreateSerializer
         ser = ParticipantBulkCreateSerializer(data=request.data)
         if not ser.is_valid():
@@ -2177,11 +2436,41 @@ class ParticipantViewSet(viewsets.ModelViewSet):
         created = []
         errors = []
         for i, item in enumerate(ser.validated_data['participants']):
-            name = (item.get('name') or '').strip()
             clicker_id = (item.get('clicker_id') or '').strip()
+            name = (item.get('name') or '').strip() or clicker_id
             email = (item.get('email') or '').strip() or None
             extra = {k: (v if isinstance(v, str) else str(v)) for k, v in item.items()
                      if k not in RESERVED_KEYS and v is not None and str(v).strip() != ''}
+            if 'class' in extra:
+                extra['class'] = str(extra['class']).strip()
+            if 'section' in extra:
+                extra['section'] = str(extra['section']).strip()
+            if 'team' in extra:
+                extra['team'] = str(extra['team']).strip()
+            cls = extra.get('class', '')
+            section = extra.get('section', '')
+            dup_qs = Participant.objects.filter(
+                created_by=request.user, clicker_id=clicker_id,
+            )
+            if cls:
+                dup_qs = dup_qs.filter(extra__class=cls)
+            else:
+                dup_qs = dup_qs.filter(Q(extra__class__isnull=True) | Q(extra__class=''))
+            if section:
+                dup_qs = dup_qs.filter(extra__section=section)
+            else:
+                dup_qs = dup_qs.filter(Q(extra__section__isnull=True) | Q(extra__section=''))
+            if dup_qs.exists():
+                scope_bits = []
+                if cls:
+                    scope_bits.append(f'class "{cls}"')
+                if section:
+                    scope_bits.append(f'section "{section}"')
+                scope_label = ' and '.join(scope_bits) if scope_bits else 'no class/section'
+                errors.append(
+                    f'Row {i + 1}: Clicker ID "{clicker_id}" already exists in {scope_label}.'
+                )
+                continue
             try:
                 school_id = get_user_school_id(request.user)
                 participant = Participant.objects.create(
@@ -2204,7 +2493,10 @@ class ParticipantViewSet(viewsets.ModelViewSet):
     def import_participants(self, request):
         file = request.FILES.get('file')
         exam_id = request.data.get('exam_id')
-        
+        default_class = (request.data.get('default_class') or '').strip() or None
+        default_section = (request.data.get('default_section') or '').strip() or None
+        default_team = (request.data.get('default_team') or '').strip() or None
+
         if not file:
             return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
         
@@ -2216,7 +2508,7 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             else:
                 return Response({'error': 'Unsupported file format'}, status=status.HTTP_400_BAD_REQUEST)
             
-            # Flexible column mapping: name and clicker_id required; email optional
+            # Flexible column mapping: clicker_id required; name optional (defaults to clicker_id); email optional
             # Normalize optional column headers to canonical keys for extra (matches frontend form)
             def _normalize_col_key(col_name):
                 if col_name is None or (isinstance(col_name, float) and pd.isna(col_name)):
@@ -2266,20 +2558,34 @@ class ParticipantViewSet(viewsets.ModelViewSet):
             clicker_col = get_col(df, 'clicker_id', 'clicker id', 'clickerid', 'clicker', 'keypad id', 'keypadid', 'keypad_id')
             email_col = get_col(df, 'email', 'e-mail', 'email address', 'email id')
             
-            if name_col is None or clicker_col is None:
+            if clicker_col is None:
                 return Response(
-                    {'error': 'File must have at least "Name" and "Clicker ID" (or "keypad id" / "clicker id") columns.'},
+                    {
+                        'error': 'File must have a Keypad / Clicker ID column (e.g. "Keypad ID", "clicker_id", "clicker id"). '
+                        'Name is optional; if omitted or empty, the keypad ID is used as the display name.',
+                    },
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            reserved = {name_col, clicker_col, email_col} if email_col else {name_col, clicker_col}
+            reserved = {clicker_col}
+            if name_col is not None:
+                reserved.add(name_col)
+            if email_col is not None:
+                reserved.add(email_col)
             imported = 0
             errors = []
+            # Track keys already imported from THIS file so that two rows sharing
+            # the same (clicker_id, class, section) don't quietly overwrite each
+            # other — instead the second occurrence is reported as a duplicate.
+            seen_keys = {}
             for idx, row in df.iterrows():
                 try:
-                    raw_name = row.get(name_col, '')
                     raw_clicker = row.get(clicker_col, '')
-                    name = '' if pd.isna(raw_name) else str(raw_name).strip()
                     clicker_id = '' if pd.isna(raw_clicker) else str(raw_clicker).strip()
+                    if name_col is not None:
+                        raw_name = row.get(name_col, '')
+                        name = '' if pd.isna(raw_name) else str(raw_name).strip()
+                    else:
+                        name = ''
                     email = None
                     if email_col:
                         raw_email = row.get(email_col, '')
@@ -2296,9 +2602,22 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                                 elif key:
                                     extra[key] = str(val).strip()
                     
-                    if not name or not clicker_id:
-                        errors.append(f"Row {idx + 2}: Name and Clicker ID are required.")
+                    if not clicker_id:
+                        errors.append(f"Row {idx + 2}: Clicker ID is required.")
                         continue
+                    name = name or clicker_id
+                    if default_class and (not extra.get('class') or not str(extra.get('class', '')).strip()):
+                        extra['class'] = default_class
+                    elif extra.get('class') is not None:
+                        extra['class'] = str(extra['class']).strip()
+                    if default_section and (not extra.get('section') or not str(extra.get('section', '')).strip()):
+                        extra['section'] = default_section
+                    elif extra.get('section') is not None:
+                        extra['section'] = str(extra['section']).strip()
+                    if default_team and (not extra.get('team') or not str(extra.get('team', '')).strip()):
+                        extra['team'] = default_team
+                    elif extra.get('team') is not None:
+                        extra['team'] = str(extra['team']).strip()
                     
                     # Avoid UNIQUE constraint on email: if this email is already used by another
                     # participant (different clicker_id), keep it only in extra and set model email to None.
@@ -2309,11 +2628,54 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                             email = None
                     
                     school_id = get_user_school_id(request.user)
-                    participant, created = Participant.objects.update_or_create(
-                        clicker_id=clicker_id,
-                        created_by=request.user,
-                        defaults={'name': name, 'email': email, 'school_id': school_id, 'extra': extra},
+                    # Uniqueness for clicker_id is scoped to (created_by, extra.class, extra.section)
+                    # so an import row only updates an existing participant when class & section also match.
+                    cls_val = str(extra.get('class', '') or '').strip()
+                    section_val = str(extra.get('section', '') or '').strip()
+                    dup_key = (clicker_id, cls_val, section_val)
+                    if dup_key in seen_keys:
+                        first_row = seen_keys[dup_key]
+                        scope_bits = []
+                        if cls_val:
+                            scope_bits.append(f'class "{cls_val}"')
+                        if section_val:
+                            scope_bits.append(f'section "{section_val}"')
+                        scope_label = ' and '.join(scope_bits) if scope_bits else 'no class/section'
+                        errors.append(
+                            f'Row {idx + 2}: Skipped — Clicker ID "{clicker_id}" in {scope_label} '
+                            f'is already used by row {first_row}. Each participant must have a unique '
+                            f'keypad ID within the same class & section.'
+                        )
+                        continue
+                    seen_keys[dup_key] = idx + 2
+                    match_qs = Participant.objects.filter(
+                        created_by=request.user, clicker_id=clicker_id,
                     )
+                    if cls_val:
+                        match_qs = match_qs.filter(extra__class=cls_val)
+                    else:
+                        match_qs = match_qs.filter(Q(extra__class__isnull=True) | Q(extra__class=''))
+                    if section_val:
+                        match_qs = match_qs.filter(extra__section=section_val)
+                    else:
+                        match_qs = match_qs.filter(Q(extra__section__isnull=True) | Q(extra__section=''))
+                    existing = match_qs.first()
+                    if existing is not None:
+                        existing.name = name
+                        existing.email = email
+                        existing.school_id = school_id
+                        existing.extra = extra
+                        existing.save(update_fields=['name', 'email', 'school_id', 'extra'])
+                        participant = existing
+                    else:
+                        participant = Participant.objects.create(
+                            name=name,
+                            clicker_id=clicker_id,
+                            email=email,
+                            school_id=school_id,
+                            extra=extra,
+                            created_by=request.user,
+                        )
                     
                     if exam_id:
                         try:
@@ -2325,8 +2687,13 @@ class ParticipantViewSet(viewsets.ModelViewSet):
                     imported += 1
                 except Exception as e:
                     errors.append(f"Row {idx + 2}: {str(e)}")
-            
-            return Response({'imported': imported, 'errors': errors})
+
+            skipped_duplicates = sum(1 for e in errors if 'Skipped — Clicker ID' in e)
+            return Response({
+                'imported': imported,
+                'errors': errors,
+                'skipped_duplicates': skipped_duplicates,
+            })
         except Exception as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -2679,24 +3046,60 @@ def _participant_report_row(participant):
 
 
 def _seconds_per_attempt_from_answers(exam):
-    """Total time per attempt = sum(Answer.time_taken); same basis as leaderboard and report Speed columns."""
-    rows = (
-        Answer.objects.filter(attempt__exam=exam)
-        .values('attempt_id')
-        .annotate(total=Sum('time_taken'))
-    )
-    return {r['attempt_id']: max(0, int(r['total'] or 0)) for r in rows}
+    """
+    Total seconds per attempt = sum of Answer.time_taken for questions still on this exam.
+
+    Must match Excel/API "Speed" rows: those iterate exam_questions only. Answers tied to
+    question_ids no longer on the exam (removed/replaced after the live session) were inflating
+    leaderboard (e.g. 36s) vs summing visible Speed cells (e.g. 5+6+7+8).
+
+    We sum in Python from values_list instead of SQL Sum+GROUP BY so production MySQL/MariaDB
+    cannot return a wrong aggregate or a key type that breaks lookup.
+    """
+    qids = list(exam.exam_questions.values_list('question_id', flat=True))
+    if not qids:
+        return {}
+    rows = Answer.objects.filter(
+        attempt__exam=exam,
+        question_id__in=qids,
+    ).values_list('attempt_id', 'time_taken')
+    out = {}
+    for aid, tt in rows:
+        if aid is None:
+            continue
+        try:
+            k = int(aid)
+        except (TypeError, ValueError):
+            continue
+        try:
+            sec = max(0, int(tt)) if tt is not None else 0
+        except (TypeError, ValueError):
+            try:
+                sec = max(0, int(float(tt)))
+            except (TypeError, ValueError):
+                sec = 0
+        out[k] = out.get(k, 0) + sec
+    return out
 
 
 def _leaderboard_display_time_seconds(attempt, seconds_from_answers):
-    """Prefer sum of answer times (leaderboard / exports); fallback to stored attempt field."""
-    if attempt.id in seconds_from_answers:
-        return seconds_from_answers[attempt.id]
-    return max(0, int(attempt.time_taken or 0))
+    """Total time = sum of Answer.time_taken for this attempt (current exam questions only — same as report Speed)."""
+    k = int(attempt.pk)
+    return max(0, int(seconds_from_answers.get(k, 0)))
 
 
-def _get_exam_report_data(exam):
-    """Build report data dict for an exam (no request needed). Used by exam_report and export."""
+def _get_exam_report_data(exam, question_scope='voted'):
+    """Build report data dict for an exam (no request needed). Used by exam_report and export.
+
+    question_scope:
+      - 'voted': question stats use only participants who submitted an answer per question (current behavior).
+      - 'all': denominators use assigned roster (ExamParticipant); accuracy = correct / assigned;
+               option percentages use assigned count; unanswered counted as no_response_count.
+    """
+    question_scope = (question_scope or 'voted').strip().lower()
+    if question_scope not in ('voted', 'all'):
+        question_scope = 'voted'
+
     attempts = ExamAttempt.objects.filter(exam=exam)
     total_participants = attempts.count()
     if total_participants == 0:
@@ -2708,19 +3111,24 @@ def _get_exam_report_data(exam):
             'highest_score': 0,
             'lowest_score': 0,
             'question_analysis': [],
-            'participant_results': []
+            'participant_results': [],
+            'question_analysis_scope': question_scope,
+            'assigned_participant_count': ExamParticipant.objects.filter(exam=exam).count(),
         }
     avg_score = attempts.aggregate(avg=Avg('score'))['avg'] or 0
     highest = attempts.aggregate(max=Max('score'))['max'] or 0
     lowest = attempts.aggregate(min=Min('score'))['min'] or 0
     questions_ordered = list(exam.exam_questions.select_related('question').order_by('order'))
+    assigned_for_questions = ExamParticipant.objects.filter(exam=exam).count()
+    if assigned_for_questions == 0:
+        assigned_for_questions = attempts.values('participant_id').distinct().count()
+
     question_analysis = []
     for eq in questions_ordered:
         question = eq.question
         answers = Answer.objects.filter(attempt__exam=exam, question=question)
-        total_attempts = answers.count()
+        answered_count = answers.count()
         correct_attempts = answers.filter(is_correct=True).count()
-        accuracy = (correct_attempts / total_attempts * 100) if total_attempts > 0 else 0
         avg_time = answers.aggregate(avg=Avg('time_taken'))['avg'] or 0
         # Per-option vote counts (0-based index -> count)
         options = question.options or []
@@ -2735,7 +3143,19 @@ def _get_exam_report_data(exam):
                         option_votes[idx] += 1
             elif isinstance(sel, int) and 0 <= sel < len(option_votes):
                 option_votes[sel] += 1
-        question_analysis.append({
+
+        if question_scope == 'all':
+            denom = assigned_for_questions
+            total_attempts = denom
+            accuracy = (correct_attempts / denom * 100) if denom > 0 else 0
+            no_response_count = max(0, denom - answered_count)
+        else:
+            denom = answered_count
+            total_attempts = answered_count
+            accuracy = (correct_attempts / denom * 100) if denom > 0 else 0
+            no_response_count = 0
+
+        row = {
             'question_id': question.id,
             'question_text': question.text,
             'total_attempts': total_attempts,
@@ -2746,7 +3166,10 @@ def _get_exam_report_data(exam):
             'option_display': getattr(question, 'option_display', 'alpha'),
             'correct_answer': _normalize_correct_answer(question.correct_answer),
             'option_votes': option_votes,
-        })
+            'answered_count': answered_count,
+            'no_response_count': no_response_count,
+        }
+        question_analysis.append(row)
     seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempts_sorted = list(attempts.select_related('participant'))
     attempts_sorted.sort(
@@ -2816,6 +3239,8 @@ def _get_exam_report_data(exam):
         'question_analysis': question_analysis,
         'participant_results': participant_results,
         'participant_detail_columns': _participant_detail_columns_with_data(participant_results),
+        'question_analysis_scope': question_scope,
+        'assigned_participant_count': assigned_for_questions,
     }
     return report_data
 
@@ -2828,7 +3253,10 @@ def exam_report(request, exam_id):
         exam = qs.get(id=exam_id)
     except Exam.DoesNotExist:
         return Response({'error': 'Exam not found'}, status=status.HTTP_404_NOT_FOUND)
-    report_data = _get_exam_report_data(exam)
+    report_data = _get_exam_report_data(
+        exam,
+        question_scope=(request.query_params.get('question_scope') or 'voted'),
+    )
     serializer = ExamReportSerializer(report_data)
     return Response(serializer.data)
 
@@ -2916,7 +3344,12 @@ def _format_attempted_option_label(question, selected_answer):
 
 
 def _write_results_by_participants_detail_sheet(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
-    """Write 'Results by Participants(Detail)' sheet to match client format: metadata, then per-participant blocks with Keypad/Name line and table Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data."""
+    """Write 'Results by Participants(Detail)' sheet to match client format: metadata, then per-participant blocks with Keypad/Name line and table Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data.
+
+    Participant blocks are ordered by Keypad ID (natural-ish sort: shorter IDs first, then
+    lexicographic), matching the 'individual' workbook layout. The Ranking field per block
+    still reflects the score-based leaderboard order.
+    """
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
     if report_timestamp_str is None:
@@ -2929,14 +3362,14 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
     white_font = Font(color='FFFFFF', bold=True)
 
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
-    attempts = list(ExamAttempt.objects.filter(exam=exam).order_by('participant__clicker_id').select_related('participant'))
+    attempts = list(ExamAttempt.objects.filter(exam=exam).select_related('participant'))
     answer_map = {}
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
     seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempts_ranked = sorted(
-        ExamAttempt.objects.filter(exam=exam),
+        attempts,
         key=lambda a: (
             -float(a.score),
             _leaderboard_display_time_seconds(a, seconds_from_answers),
@@ -2944,6 +3377,15 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
     )
     rank_by_attempt_id = {a.id: rank for rank, a in enumerate(attempts_ranked, 1)}
     total_participants = len(attempts_ranked)
+    # Full report: walk participants in Keypad ID order (natural-ish: shorter ids first, then
+    # lexicographic). Ranking shown per block still comes from the score-based ordering above.
+    attempts_by_keypad = sorted(
+        attempts,
+        key=lambda a: (
+            len((a.participant.clicker_id or '') or ''),
+            (a.participant.clicker_id or '') or '',
+        ),
+    )
 
     row_num = 1
     ws.cell(row=row_num, column=1, value='Results by Participants(Detail)')
@@ -2968,7 +3410,7 @@ def _write_results_by_participants_detail_sheet(workbook, exam, participant_deta
         row_num += 1
     row_num += 1
 
-    for attempt in attempts:
+    for attempt in attempts_by_keypad:
         participant = attempt.participant
         keypad = getattr(participant, 'clicker_id', None) or participant.name or str(participant.id)
         user_row = _participant_report_row(participant)
@@ -3033,7 +3475,8 @@ def _sanitize_sheet_name(name):
 
 
 def _write_results_by_participants_individual(workbook, exam, participant_detail_columns=None, report_timestamp_str=None):
-    """One sheet per participant (sheet name = keypad id). Same layout as reference: title, date, questions count, metadata, Keypad summary, then Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data (if participant_detail_columns provided)."""
+    """One sheet per participant (sheet name = keypad id). Sheets are ordered by Keypad ID (natural sort).
+    Same layout as reference: title, date, questions count, metadata, Keypad summary, then Question|Option|Response|Slide Type|Correct Answer|Speed|Score. Only includes user-detail fields that have data (if participant_detail_columns provided)."""
     if participant_detail_columns is None:
         participant_detail_columns = list(PARTICIPANT_REPORT_FIELDS)
     if report_timestamp_str is None:
@@ -3043,14 +3486,14 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
     bold_font = Font(bold=True)
 
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
-    attempts = list(ExamAttempt.objects.filter(exam=exam).order_by('participant__clicker_id').select_related('participant'))
+    attempts = list(ExamAttempt.objects.filter(exam=exam).select_related('participant'))
     answer_map = {}
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
         answer_map[(a.attempt_id, a.question_id)] = a
 
     seconds_from_answers = _seconds_per_attempt_from_answers(exam)
     attempts_ranked = sorted(
-        ExamAttempt.objects.filter(exam=exam),
+        attempts,
         key=lambda a: (
             -float(a.score),
             _leaderboard_display_time_seconds(a, seconds_from_answers),
@@ -3058,11 +3501,19 @@ def _write_results_by_participants_individual(workbook, exam, participant_detail
     )
     rank_by_attempt_id = {a.id: rank for rank, a in enumerate(attempts_ranked, 1)}
     total_participants = len(attempts_ranked)
+    # Individual workbook: one sheet per participant — sheet order follows Keypad ID (not rank).
+    attempts_by_keypad = sorted(
+        attempts,
+        key=lambda a: (
+            len((a.participant.clicker_id or '') or ''),
+            (a.participant.clicker_id or '') or '',
+        ),
+    )
 
     n_questions = len(exam_questions)
     report_date = report_timestamp_str
 
-    for attempt in attempts:
+    for attempt in attempts_by_keypad:
         participant = attempt.participant
         keypad = getattr(participant, 'clicker_id', None) or str(participant.id)
         user_row = _participant_report_row(participant)
@@ -3271,9 +3722,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam, report_timestam
     red_fill = PatternFill(start_color='FFB6C1', end_color='FFB6C1', fill_type='solid')    # light red for wrong
 
     exam_questions = list(exam.exam_questions.select_related('question').order_by('order'))
-    assigned = list(ExamParticipant.objects.filter(exam=exam).select_related('participant').order_by('participant__clicker_id'))
-    # Natural order by keypad id (1, 2, ... 9, 10, 11)
-    assigned.sort(key=lambda ep: (len(ep.participant.clicker_id or ''), ep.participant.clicker_id or ''))
+    assigned = list(ExamParticipant.objects.filter(exam=exam).select_related('participant'))
     attempts_by_participant = {a.participant_id: a for a in ExamAttempt.objects.filter(exam=exam).select_related('participant')}
     answer_map = {}  # (attempt_id, question_id) -> Answer
     for a in Answer.objects.filter(attempt__exam=exam).select_related('attempt', 'question'):
@@ -3290,7 +3739,16 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam, report_timestam
     rank_by_attempt = {a.id: idx + 1 for idx, a in enumerate(attempted_list)}
     voted_count = len(attempted_list)
 
-    assigned_sorted = sorted(assigned, key=lambda ep: ep.participant.clicker_id or '')
+    attempted_ids = set(attempts_by_participant.keys())
+    assigned_ranked = []
+    for att in attempted_list:
+        for ep in assigned:
+            if ep.participant_id == att.participant_id:
+                assigned_ranked.append(ep)
+                break
+    absent_eps = [ep for ep in assigned if ep.participant_id not in attempted_ids]
+    absent_eps.sort(key=lambda ep: (len(ep.participant.clicker_id or ''), ep.participant.clicker_id or ''))
+    assigned_for_rows = assigned_ranked + absent_eps
 
     row = 1
     ws.cell(row=row, column=1, value='Personal Achievement and Detail')
@@ -3315,7 +3773,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam, report_timestam
         ws.cell(row=row, column=2, value=col_b)
         row += 1
     # Table header row: Keypad No., Name, then only detail columns that have data (excl. name/clicker_id), then Score, Correct Rate, Ranking, then question columns
-    user_rows = [_participant_report_row(ep.participant) for ep in assigned_sorted]
+    user_rows = [_participant_report_row(ep.participant) for ep in assigned]
     detail_columns = _participant_detail_columns_with_data(user_rows)
     detail_columns_no_id = [(label, key) for (label, key) in detail_columns if key not in ('name', 'clicker_id')]
     headers = ['Keypad No.', 'Name'] + [label for (label, _) in detail_columns_no_id] + ['Score', 'Correct Rate', 'Ranking']
@@ -3325,7 +3783,7 @@ def _write_personal_achievement_and_detail_sheet(workbook, exam, report_timestam
         ws.cell(row=row, column=col, value=h)
     row += 1
 
-    for ep in assigned_sorted:
+    for ep in assigned_for_rows:
         p = ep.participant
         user_row = _participant_report_row(p)
         attempt = attempts_by_participant.get(p.id)
@@ -3551,6 +4009,25 @@ def dashboard(request):
     participants_qs = scope_participants_queryset(Participant.objects.all(), user)
     total_participants = participants_qs.count()
     
+    # Per-exam total marks (sum of ExamQuestion.positive_marks). Cached so the
+    # loops below don't trigger a fresh aggregate query for every attempt.
+    def _exam_total_marks(exam_obj, cache):
+        if exam_obj.id in cache:
+            return cache[exam_obj.id]
+        try:
+            v = float(exam_obj.total_marks or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v <= 0:
+            try:
+                v = float(exam_obj.positive_marking or 0)
+            except (TypeError, ValueError):
+                v = 0.0
+        cache[exam_obj.id] = v
+        return v
+
+    exam_total_marks_cache = {}
+
     # Calculate average score from all attempts (only for user's visible exams)
     all_attempts = ExamAttempt.objects.filter(exam__in=exams).select_related('exam')
     if all_attempts.exists():
@@ -3558,7 +4035,10 @@ def dashboard(request):
         count = 0
         for attempt in all_attempts:
             if attempt.total_questions > 0:
-                percentage = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
+                max_marks = _exam_total_marks(attempt.exam, exam_total_marks_cache)
+                if max_marks <= 0:
+                    continue
+                percentage = (float(attempt.score) / max_marks) * 100
                 total_percentage += percentage
                 count += 1
         avg_score = total_percentage / count if count > 0 else 0
@@ -3585,9 +4065,10 @@ def dashboard(request):
         if attempts.exists():
             total_percentage = 0
             count = 0
+            max_marks = _exam_total_marks(exam, exam_total_marks_cache)
             for attempt in attempts:
-                if attempt.total_questions > 0:
-                    percentage = (float(attempt.score) / (attempt.total_questions * float(exam.positive_marking))) * 100
+                if attempt.total_questions > 0 and max_marks > 0:
+                    percentage = (float(attempt.score) / max_marks) * 100
                     total_percentage += percentage
                     count += 1
             avg_exam_score = total_percentage / count if count > 0 else 0
@@ -3618,7 +4099,10 @@ def dashboard(request):
             count = 0
             for attempt in day_attempts:
                 if attempt.total_questions > 0:
-                    percentage = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
+                    max_marks = _exam_total_marks(attempt.exam, exam_total_marks_cache)
+                    if max_marks <= 0:
+                        continue
+                    percentage = (float(attempt.score) / max_marks) * 100
                     total_percentage += percentage
                     count += 1
             avg_day_score = total_percentage / count if count > 0 else 0
@@ -3643,7 +4127,11 @@ def dashboard(request):
 
 
 def _build_student_performance_rows(user, query_params):
-    """Build role-scoped student performance rows from query params."""
+    """Build role-scoped student performance rows: one row per participant per exam (submitted attempt).
+
+    Optional query params: admission_no, roll_no, student_name, class_name, section, teacher_name, subject,
+    exam_name (substring match on exam title), exam_id (exact), from_date, to_date.
+    """
     # Role-wise scoping
     participants_qs = scope_participants_queryset(Participant.objects.all(), user)
     exams_qs = scope_exams_queryset(Exam.objects.all(), user)
@@ -3655,6 +4143,8 @@ def _build_student_performance_rows(user, query_params):
     section = (query_params.get('section') or '').strip().lower()
     teacher_name = (query_params.get('teacher_name') or '').strip().lower()
     subject = (query_params.get('subject') or '').strip().lower()
+    exam_name = (query_params.get('exam_name') or '').strip()
+    exam_id_raw = (query_params.get('exam_id') or '').strip()
     from_date = (query_params.get('from_date') or '').strip()
     to_date = (query_params.get('to_date') or '').strip()
 
@@ -3663,43 +4153,59 @@ def _build_student_performance_rows(user, query_params):
         participant__in=participants_qs,
     ).select_related('participant', 'exam')
 
+    if exam_id_raw:
+        try:
+            attempts_qs = attempts_qs.filter(exam_id=int(exam_id_raw))
+        except (TypeError, ValueError):
+            pass
+    if exam_name:
+        attempts_qs = attempts_qs.filter(exam__title__icontains=exam_name)
+
     if from_date:
         attempts_qs = attempts_qs.filter(submitted_at__date__gte=from_date)
     if to_date:
         attempts_qs = attempts_qs.filter(submitted_at__date__lte=to_date)
 
-    rows_by_participant = {}
-    for attempt in attempts_qs:
+    rows = []
+    for attempt in attempts_qs.order_by('exam__title', 'participant__name'):
         p = attempt.participant
         if not p:
             continue
         extra = p.extra or {}
         name_val = (p.name or '').strip()
-        row = rows_by_participant.get(p.id)
-        if row is None:
-            row = {
-                'participant_id': p.id,
-                'admission_no': (extra.get('admission_no') or '').strip() if isinstance(extra, dict) else '',
-                'roll_no': (extra.get('roll_no') or '').strip() if isinstance(extra, dict) else '',
-                'student_name': name_val,
-                'class_name': (extra.get('class') or '').strip() if isinstance(extra, dict) else '',
-                'section': (extra.get('section') or '').strip() if isinstance(extra, dict) else '',
-                'teacher_name': (extra.get('teacher_name') or '').strip() if isinstance(extra, dict) else '',
-                'subject': (extra.get('subject') or '').strip() if isinstance(extra, dict) else '',
-                '_attempts': 0,
-                '_pct_sum': 0.0,
-            }
-            rows_by_participant[p.id] = row
-
+        row = {
+            'participant_id': p.id,
+            'exam_id': attempt.exam_id,
+            'exam_name': (attempt.exam.title or '').strip(),
+            'exam_created_at': attempt.exam.created_at.isoformat() if attempt.exam.created_at else None,
+            'exam_updated_at': attempt.exam.updated_at.isoformat() if attempt.exam.updated_at else None,
+            'submitted_at': attempt.submitted_at.isoformat() if attempt.submitted_at else None,
+            'admission_no': (extra.get('admission_no') or '').strip() if isinstance(extra, dict) else '',
+            'roll_no': (extra.get('roll_no') or '').strip() if isinstance(extra, dict) else '',
+            'student_name': name_val,
+            'class_name': (extra.get('class') or '').strip() if isinstance(extra, dict) else '',
+            'section': (extra.get('section') or '').strip() if isinstance(extra, dict) else '',
+            'teacher_name': (extra.get('teacher_name') or '').strip() if isinstance(extra, dict) else '',
+            'subject': (extra.get('subject') or '').strip() if isinstance(extra, dict) else '',
+        }
+        # Percentage uses the exam's real total marks (sum of ExamQuestion.positive_marks).
+        # Fall back to the legacy single-value `Exam.positive_marking` only when no
+        # per-question marks are recorded yet (rare, draft exams).
         pct = 0.0
-        if attempt.total_questions and float(getattr(attempt.exam, 'positive_marking', 1) or 1) > 0:
-            pct = (float(attempt.score) / (attempt.total_questions * float(attempt.exam.positive_marking))) * 100
-        row['_attempts'] += 1
-        row['_pct_sum'] += pct
+        try:
+            max_marks = float(getattr(attempt.exam, 'total_marks', 0) or 0)
+        except (TypeError, ValueError):
+            max_marks = 0.0
+        if max_marks <= 0:
+            try:
+                legacy = float(getattr(attempt.exam, 'positive_marking', 0) or 0)
+            except (TypeError, ValueError):
+                legacy = 0.0
+            max_marks = (attempt.total_questions or 0) * legacy
+        if attempt.total_questions and max_marks > 0:
+            pct = (float(attempt.score) / max_marks) * 100
+        row['total_percentage'] = round(pct, 2)
 
-    rows = []
-    for row in rows_by_participant.values():
-        # Apply text filters on flattened row values
         if admission_no and admission_no not in (row['admission_no'] or '').lower():
             continue
         if roll_no and roll_no not in (row['roll_no'] or '').lower():
@@ -3715,12 +4221,15 @@ def _build_student_performance_rows(user, query_params):
         if subject and subject not in (row['subject'] or '').lower():
             continue
 
-        attempts_count = row.pop('_attempts', 0) or 0
-        pct_sum = row.pop('_pct_sum', 0.0) or 0.0
-        row['total_percentage'] = round((pct_sum / attempts_count), 2) if attempts_count > 0 else 0.0
         rows.append(row)
 
-    rows.sort(key=lambda x: (-float(x.get('total_percentage') or 0), (x.get('student_name') or '').lower()))
+    rows.sort(
+        key=lambda x: (
+            (x.get('exam_name') or '').lower(),
+            (x.get('student_name') or '').lower(),
+            -float(x.get('total_percentage') or 0),
+        )
+    )
     return rows
 
 
@@ -3729,8 +4238,9 @@ def _build_student_performance_rows(user, query_params):
 def student_performance_report(request):
     """
     GET /api/reports/student-performance/
-    Role-scoped student performance rows with optional filters:
+    Role-scoped rows: one per participant per exam (submitted attempt). Optional filters:
       admission_no, roll_no, student_name, class_name, section, teacher_name, subject,
+      exam_name (substring on exam title), exam_id (exact),
       from_date (YYYY-MM-DD), to_date (YYYY-MM-DD)
     """
     rows = _build_student_performance_rows(request.user, request.query_params)
@@ -3750,11 +4260,17 @@ def student_performance_report_export(request):
     format_type = 'excel' if raw in ('excel', 'xlsx', '') else 'csv'
 
     columns = [
+        'exam_id', 'exam_name', 'exam_created_at', 'exam_updated_at', 'submitted_at',
         'admission_no', 'roll_no', 'student_name', 'class_name',
         'section', 'teacher_name', 'subject', 'total_percentage'
     ]
     df = pd.DataFrame(rows, columns=columns)
     df = df.rename(columns={
+        'exam_id': 'Exam ID',
+        'exam_name': 'Exam Name',
+        'exam_created_at': 'Exam created',
+        'exam_updated_at': 'Exam last updated',
+        'submitted_at': 'Submitted at',
         'admission_no': 'Admission No',
         'roll_no': 'Roll No',
         'student_name': 'Student Name',
@@ -3762,7 +4278,7 @@ def student_performance_report_export(request):
         'section': 'Section',
         'teacher_name': 'Teacher Name',
         'subject': 'Subject',
-        'total_percentage': 'Total Percentage %',
+        'total_percentage': 'Percentage %',
     })
 
     output = BytesIO()

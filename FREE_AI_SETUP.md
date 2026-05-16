@@ -33,23 +33,38 @@ We now support **Google Gemini** which offers a **completely free tier** with no
 
 4. **That's it!** The system will automatically use Gemini if the key is set.
 
-### Option 2: OpenAI (Paid)
+### Option 2: OpenAI GPT (paid)
 
-- Requires credits/billing
-- Better quality but costs money
-- Set `OPENAI_API_KEY` in `.env`
+- Uses the Chat Completions API (`openai` Python package).
+- Set in `.env`:
+  ```bash
+  OPENAI_API_KEY=sk-...
+  OPENAI_MODEL=gpt-4o-mini   # optional; default gpt-4o-mini. Try gpt-4o for higher quality.
+  # Optional: Azure or custom gateway
+  # OPENAI_BASE_URL=https://...
+  ```
+- **Prefer OpenAI first** (before Groq/Gemini):
+  ```bash
+  QUESTION_AI_PROVIDERS=openai,groq,gemini
+  ```
+- **OpenAI only** (skip other providers):
+  ```bash
+  QUESTION_AI_PROVIDERS=openai
+  ```
 
 ### How It Works
 
-The system tries AI providers in this order:
-1. **Groq** (if `GROQ_API_KEY` is set) – free tier available at https://console.groq.com
-2. **Gemini** (if `GEMINI_API_KEY` is set) – FREE
-3. **OpenAI** (if `OPENAI_API_KEY` is set) – PAID
-4. **Mock/Sample** questions (if none are available)
+Provider order is controlled by **`QUESTION_AI_PROVIDERS`** (comma-separated: `groq`, `gemini`, `openai`).  
+Default if unset: `openai,groq,gemini` (GPT first, then Groq, then Gemini).
+
+For each name in order, the backend uses that provider **only if** its API key is configured and generation returns questions; otherwise it tries the next.
+
+4. **Mock/Sample** questions if no provider succeeds.
 
 When you run the backend, the server console will print which provider was used, e.g.:
 - `[EasyTest AI] Generated 5 questions using Groq for topic: ...`
-- `[EasyTest AI] No API key configured. Using sample questions. Add GROQ_API_KEY or GEMINI_API_KEY to .env`
+- `[EasyTest AI] Generated 5 questions using OpenAI for topic: ...`
+- `[EasyTest AI] No API key configured. Using sample questions...`
 
 ### Get Your Free Gemini API Key
 

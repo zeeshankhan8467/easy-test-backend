@@ -153,6 +153,10 @@ class ExamQuestion(models.Model):
     positive_marks = models.DecimalField(max_digits=5, decimal_places=2, default=1.0, help_text="Marks for correct answer")
     negative_marks = models.DecimalField(max_digits=5, decimal_places=2, default=0.0, help_text="Marks deducted for wrong answer")
     is_optional = models.BooleanField(default=False, help_text="Whether this question is optional")
+    allow_revise = models.BooleanField(
+        default=True,
+        help_text="Allow participants to change their answer after first submit on this question (requires exam revisable)",
+    )
 
     class Meta:
         unique_together = ['exam', 'question']
@@ -168,7 +172,10 @@ class ExamQuestion(models.Model):
 class Participant(models.Model):
     name = models.CharField(max_length=200)
     email = models.EmailField(blank=True, null=True, unique=True)  # optional
-    # Unique per owner (teacher), not globally — different teachers may use the same keypad IDs.
+    # Uniqueness for clicker_id is enforced in serializers/views scoped to
+    # (created_by, extra.class, extra.section). The same keypad ID may exist
+    # for the same teacher across different sections (e.g. 10-A vs 10-B), so
+    # there is no DB-level UniqueConstraint on clicker_id alone.
     clicker_id = models.CharField(max_length=50)
     school = models.ForeignKey(
         School, on_delete=models.CASCADE, null=True, blank=True,
@@ -180,12 +187,6 @@ class Participant(models.Model):
 
     class Meta:
         ordering = ['clicker_id']
-        constraints = [
-            models.UniqueConstraint(
-                fields=['created_by', 'clicker_id'],
-                name='uniq_participant_created_by_clicker_id',
-            ),
-        ]
 
     def __str__(self):
         return self.name
@@ -253,9 +254,29 @@ class ExamAttempt(models.Model):
 
     @property
     def percentage(self):
+        """Score as a percentage of the exam's real total marks.
+
+        Uses the sum of `ExamQuestion.positive_marks` (exposed via `Exam.total_marks`)
+        rather than the legacy single-value `Exam.positive_marking` field, which only
+        held a fallback "1.0" for older exams and produced inflated percentages
+        (e.g. 200%) when individual questions were worth more than 1 mark.
+        """
         if self.total_questions == 0:
             return 0
-        return (self.score / (self.total_questions * self.exam.positive_marking)) * 100
+        try:
+            max_marks = float(self.exam.total_marks or 0)
+        except (TypeError, ValueError):
+            max_marks = 0.0
+        if max_marks <= 0:
+            # Fallback for exams that have no per-question marks recorded yet.
+            try:
+                legacy = float(self.exam.positive_marking or 0)
+            except (TypeError, ValueError):
+                legacy = 0.0
+            max_marks = self.total_questions * legacy
+        if max_marks <= 0:
+            return 0
+        return (float(self.score) / max_marks) * 100
 
 
 class Answer(models.Model):
